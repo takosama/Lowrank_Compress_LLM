@@ -41,7 +41,7 @@ class MyConv1D(nn.Module):
     def __init__(self, nf, nx):
         super().__init__()
         self.nf = nf
-        rank = 256
+        rank = 16
         self.u = nn.Parameter(torch.zeros(
             nf, rank))
         self.v = nn.Parameter(torch.zeros(
@@ -54,7 +54,7 @@ class MyConv1D(nn.Module):
 
     def from_Conv1D(self, conv1d: nn.Module):
         self.nf = conv1d.nf
-        rank = 256
+        rank = 16
         # rank分解を行う
 
         # Perform SVD
@@ -145,7 +145,7 @@ class LoraManagerbase(AutoModelWithLMHead):
                 for part in component_parts:
                     target = getattr(target, part)
                 for param in params:
-                    torch.nn.init.normal_(getattr(target, param), 0, 0.2)
+                    torch.nn.init.normal_(getattr(target, param), 0, 0.5)
 
                     getattr(target, param).requires_grad = True
 
@@ -251,7 +251,7 @@ class LoraTrainer:
             torch.cuda.empty_cache()
             loss_sum = 0
             self.optimizer = Lion(
-                self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+                self.model.parameters(), lr=1e-5, weight_decay=1e-4)
 
             self.optimizer.zero_grad()
             h_ = len(self.model.base_model.h)
@@ -279,9 +279,9 @@ class LoraTrainer:
                 loss.backward()
 
                 torch.cuda.empty_cache()
-                if (step+1) % 16 == 0:
+                if (step+1) % 8 == 0:
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),  0.1)
+                        self.model.parameters(), 1)
                     torch.cuda.empty_cache()
                     self.optimizer.step()
                     torch.cuda.empty_cache()
@@ -318,24 +318,36 @@ class LoraTrainer:
             torch.cuda.empty_cache()
 
 
+class BatchLabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(BatchLabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
+
+    def forward(self, input, target):
+        log_prob = F.log_softmax(input, dim=-1)
+        weight = input.new_ones(input.size()) * \
+            self.smoothing / (input.size(-1) - 1.)
+        weight.scatter_(-1, target.unsqueeze(-1), (1. - self.smoothing))
+        loss = (-weight * log_prob).sum(dim=-1)
+        return loss
+
+
 class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.005, mask_penalty=0.1):
+    def __init__(self, label_smoothing=0.1, mask_penalty=0.1):
         super().__init__()
         self.pad_id = 3
-        self.label_smoothing = label_smoothing
         self.mask_penalty = mask_penalty
+        self.l = BatchLabelSmoothingCrossEntropy(label_smoothing)
 
     def forward(self, input, target, attention_mask=None):
         batch_size, sequence_length, num_classes = input.size()
-        # [2,512,32000]
+
         # Create a mask from the target tensor
         mask_target = (target == self.pad_id).float()
         mask_target2 = (target != self.pad_id).float()
 
-        # Apply the mask to the loss
-        loss = nn.CrossEntropyLoss(reduction='none')(
-            input.view(-1, num_classes), target.view(-1))
-        loss = loss.view(batch_size, sequence_length)
+        loss = self.l(input.view(-1, num_classes), target.view(-1)
+                      ).view(batch_size, sequence_length)
 
         # Zero out the loss where the target is a pad token
         # Note the "1 - mask_target"
