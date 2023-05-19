@@ -44,7 +44,8 @@ class MyConv1D(nn.Module):
         rank = 256
         self.u = nn.Parameter(torch.zeros(
             nf, rank))
-
+        self.v = nn.Parameter(torch.zeros(
+            rank, nx))
         self.wu = nn.Parameter(torch.zeros(
             nf, rank))
         self.wv = nn.Parameter(torch.zeros(
