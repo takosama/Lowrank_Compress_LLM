@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from lib import QADataset, Swish
 from transformers import AutoModelWithLMHead, AutoConfig
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -25,6 +24,60 @@ import random
 import transformers
 
 CUDA_DEBUGGING = True
+
+
+class QADataset(Dataset):
+    def __init__(self, data, tokenizer, max_length):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.cash = []
+        for d in tqdm(range(len(self.data))):
+            self.cash.append(self.get(d))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.cash[idx]
+
+    def get(self, idx):
+        try:
+            self.tokenizer.sep_token_id = 5
+            d = self.data[idx]
+            instruction = d["instruction"]
+            instruction = str.lower(instruction)
+            in_ = d["context"]
+            in_ = str.lower(in_)
+            out = d["response"]
+            out = str.lower(out)
+            question = f"h[SEP]{instruction}[SEP]{in_}[SEP]"
+            answer = f"a[SEP]{out}</s>"
+
+            # self.tokenizer.pad_token_idv
+
+            input_ids = self.tokenizer.encode(question, truncation=True,
+                                              max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=False)
+            target_ids = self. tokenizer.encode(answer, truncation=True,
+                                                max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=False)
+            # 4 padを0にする
+            attention_mask = (input_ids != 3).long()
+            # 次元を落とす
+            attention_mask = attention_mask.squeeze(0)
+            if input_ids[0].shape[0] != 256 or attention_mask.shape[0] != 256 or target_ids[0].shape[0] != 256:
+                pass
+            return {"input_ids": input_ids[0], "attention_mask": attention_mask, "labels": target_ids[0], "text": question}
+        except Exception as e:
+            print(e)
+            return {"input_ids": torch.zeros(self.max_length).int(), "attention_mask": torch.zeros(self.max_length).int(), "labels": torch.zeros(self.max_length).int()}
+
+
+class Swish(nn.Module):
+    def __init__(self):
+        super(Swish, self).__init__()
+
+    def forward(self, x):
+        return torch.mul(x,  torch.sigmoid(x))
 
 
 class MyConv1D(nn.Module):
