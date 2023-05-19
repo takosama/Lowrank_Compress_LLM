@@ -251,7 +251,7 @@ class LoraTrainer:
             torch.cuda.empty_cache()
             loss_sum = 0
             self.optimizer = Lion(
-                self.model.parameters(), lr=1e-5, weight_decay=1e-4)
+                self.model.parameters(), lr=1e-4, weight_decay=1e-4)
 
             self.optimizer.zero_grad()
             h_ = len(self.model.base_model.h)
@@ -279,7 +279,7 @@ class LoraTrainer:
                 loss.backward()
 
                 torch.cuda.empty_cache()
-                if (step+1) % 8 == 0:
+                if (step+1) % 32 == 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 1)
                     torch.cuda.empty_cache()
