@@ -103,8 +103,8 @@ class MyConv1D(nn.Module):
     def __init__(self, nf, nx):
         super().__init__()
         self.nf = nf
-        rank = 128
-        rank2 = 128
+        rank = 256
+        rank2 = 256
         self.u = nn.Parameter(torch.zeros(
             nf, rank2))
         self.v = nn.Parameter(torch.zeros(
@@ -117,8 +117,8 @@ class MyConv1D(nn.Module):
 
     def from_Conv1D(self, conv1d: nn.Module):
         self.nf = conv1d.nf
-        rank = 128
-        rank2 = 128
+        rank = 256
+        rank2 = 256
         # rank分解を行う
 
         # Perform SVD
@@ -132,20 +132,19 @@ class MyConv1D(nn.Module):
 
         self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2))
         self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)))
-
+        torch.nn.init.normal_(self.u, 0, 0.6)
+        torch.nn.init.normal_(self.v, 0, 0.6)
+        self.u.requires_grad = True
+        self.v.requires_grad = True
         self.b = conv1d.bias
-        self.act = Swish((self.u).size())
-        self.act2 = Swish((self.v).size())
+        self.b.requires_grad = False
         return self
 
     def f(self, x):
         size_out = x.size()[:-1] + (self.nf,)
         x = x.softmax(-1)
         x = torch.addmm(self.b, x.view(-1, x.size(-1)),
-                        torch.add(
-
-            self.u
-            @ self.v, self.wu@self.wv))
+                        torch.add(self.u @ self.v, (self.wu@self.wv).detach()))
         x = x.view(size_out)
         torch.cuda.empty_cache()
         return x
@@ -198,43 +197,43 @@ class LoraManagerbase(AutoModelWithLMHead):
         print(r)
         return r
 
-    @ classmethod
-    def Set_Train_Layer(cls, model, l):
-        on = [23, 22, 21, 20, 19, 18, 17, 16, 15,
-              14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
-        components = ['mlp.c_fc', 'mlp.c_proj',
-                      'attn.c_attn', 'attn.c_proj']
-        params = ['u', 'v', "b"]
-
-        def init_weights(model, layer, components, params):
-            for component in components:
-                component_parts = component.split('.')
-                target = model.base_model.h[layer]
-                for part in component_parts:
-                    target = getattr(target, part)
-                for param in params:
-                    torch.nn.init.normal_(getattr(target, param), 0, 0.2)
-
-                    getattr(target, param).requires_grad = True
-
-        def init_weights2(model, layer, components, params):
-            for component in components:
-                component_parts = component.split('.')
-                target = model.base_model.h[layer]
-                for part in component_parts:
-                    target = getattr(target, part)
-                for param in params:
-                    getattr(target, param).requires_grad = False
-
-        for i in on:
-            init_weights(model, i, components, params)
-
-        for i in range(len(model.base_model.h)):
-            if i not in on:
-                init_weights2(model, i, components, params)
-
-        return model
-
+ # @ classmethod
+ # def Set_Train_Layer(cls, model, l):
+   #     on = [23, 22, 21, 20, 19, 18, 17, 16, 15,
+   #           14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+   #     components = ['mlp.c_fc', 'mlp.c_proj',
+   #                   'attn.c_attn', 'attn.c_proj']
+   #     params = ['u', 'v', "b"]
+#
+   #     def init_weights(model, layer, components, params):
+   #         for component in components:
+   #             component_parts = component.split('.')
+   #             target = model.base_model.h[layer]
+   #             for part in component_parts:
+   #                 target = getattr(target, part)
+   #             for param in params:
+   #                 torch.nn.init.normal_(getattr(target, param), 0, 0.2)
+#
+   #                 getattr(target, param).requires_grad = True
+#
+   #     def init_weights2(model, layer, components, params):
+   #         for component in components:
+   #             component_parts = component.split('.')
+   #             target = model.base_model.h[layer]
+   #             for part in component_parts:
+   #                 target = getattr(target, part)
+   #             for param in params:
+   #                 getattr(target, param).requires_grad = False
+#
+   #     for i in on:
+   #         init_weights(model, i, components, params)
+#
+   #     for i in range(len(model.base_model.h)):
+   #         if i not in on:
+   #             init_weights2(model, i, components, params)
+#
+   #     return model
+##
     @ classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, device, *model_args, **kwargs):
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
@@ -319,9 +318,9 @@ class LoraTrainer:
             torch.cuda.empty_cache()
             loss_sum = 0
             self.optimizer = Lion(
-                self.model.parameters(), lr=6e-4, weight_decay=1e-4)
+                self.model.parameters(), lr=1e-4, weight_decay=4e-5)
             num_warmup_steps = 10  # warmupステップ数は調整が必要です
-            a_rate = 16
+            a_rate = 32
             # dataloaderは訓練データのDataLoaderです
             num_training_steps = epochs * len(self.dataloader)/a_rate
 
@@ -329,7 +328,6 @@ class LoraTrainer:
                 self.optimizer, num_warmup_steps, num_training_steps)
             self.optimizer.zero_grad()
             h_ = len(self.model.base_model.h)
-            LoraManagerbase.Set_Train_Layer(self.model, h_-1)
             self.model.train()
             for data in tq:
                 # 学習の処理
