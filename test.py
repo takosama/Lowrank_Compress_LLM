@@ -1,4 +1,5 @@
 
+from transformers import AdamW, get_cosine_schedule_with_warmup
 from torch.utils.checkpoint import checkpoint
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 import csv
@@ -73,11 +74,19 @@ class QADataset(Dataset):
 
 
 class Swish(nn.Module):
-    def __init__(self):
+    def __init__(self, size):
         super(Swish, self).__init__()
+        self.e = nn.Parameter(torch.randn(size))
+        self.a = nn.Parameter(torch.randn(size))
+        torch.nn.init.normal_(self.e, 0, 0.1)
+        torch.nn.init.normal_(self.a, 0, 0.1)
+
+    def f(self, x):
+        return torch.mul(x,  torch.sigmoid((x+self.e)*self.a))
 
     def forward(self, x):
-        return torch.mul(x,  torch.sigmoid(x))
+        output = checkpoint(self.f, x)
+        return output
 
 
 class MyConv1D(nn.Module):
@@ -94,11 +103,12 @@ class MyConv1D(nn.Module):
     def __init__(self, nf, nx):
         super().__init__()
         self.nf = nf
-        rank = 16
+        rank = 128
+        rank2 = 128
         self.u = nn.Parameter(torch.zeros(
-            nf, rank))
+            nf, rank2))
         self.v = nn.Parameter(torch.zeros(
-            rank, nx))
+            rank2, nx))
         self.wu = nn.Parameter(torch.zeros(
             nf, rank))
         self.wv = nn.Parameter(torch.zeros(
@@ -107,36 +117,41 @@ class MyConv1D(nn.Module):
 
     def from_Conv1D(self, conv1d: nn.Module):
         self.nf = conv1d.nf
-        rank = 16
+        rank = 128
+        rank2 = 128
         # rank分解を行う
 
         # Perform SVD
         u, s, v = torch.svd(conv1d.weight)
-
+        transformers.GPT2Model
         # Keep only the top 'rank' components
         self.wu = nn.Parameter(u[:, : rank] * s[: rank].sqrt())
         self.wv = nn.Parameter((v[:, : rank] * s[: rank].sqrt()).t())
         self.wu.requires_grad = False
         self.wv.requires_grad = False
 
-        self.u = nn.Parameter(torch.zeros(self.wu.size()))
-        self.v = nn.Parameter(torch.zeros(self.wv.size()))
+        self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2))
+        self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)))
 
         self.b = conv1d.bias
-        self.act = Swish()
+        self.act = Swish((self.u).size())
+        self.act2 = Swish((self.v).size())
         return self
 
     def f(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-
+        x = x.softmax(-1)
         x = torch.addmm(self.b, x.view(-1, x.size(-1)),
-                        (self.act(self.u)@self.act(self.v)).detach()+self.wu@self.wv)
+                        torch.add(
+            self.act(
+                self.u)
+            @ self.act2(self.v), self.wu@self.wv))
         x = x.view(size_out)
         torch.cuda.empty_cache()
         return x
 
     def forward(self, x):
-        output = checkpoint(self.f,   x)
+        output = checkpoint(self.f, x)
         return output
 
 
@@ -198,7 +213,7 @@ class LoraManagerbase(AutoModelWithLMHead):
                 for part in component_parts:
                     target = getattr(target, part)
                 for param in params:
-                    torch.nn.init.normal_(getattr(target, param), 0, 0.5)
+                    torch.nn.init.normal_(getattr(target, param), 0, 0.2)
 
                     getattr(target, param).requires_grad = True
 
@@ -305,7 +320,12 @@ class LoraTrainer:
             loss_sum = 0
             self.optimizer = Lion(
                 self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+            num_warmup_steps = 10  # warmupステップ数は調整が必要です
+            # dataloaderは訓練データのDataLoaderです
+            num_training_steps = epochs * len(self.dataloader)/32
 
+            scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer, num_warmup_steps, num_training_steps)
             self.optimizer.zero_grad()
             h_ = len(self.model.base_model.h)
             LoraManagerbase.Set_Train_Layer(self.model, h_-1)
@@ -325,9 +345,8 @@ class LoraTrainer:
                     inputs, attention_mask=attention_mask, labels=labels)
                 torch.cuda.empty_cache()
 
-                # loss = lora_outputs["loss"]
                 loss = lora_outputs["logits"]
-                loss = criterion(loss, labels, attention_mask)
+                loss = criterion(loss, labels, attention_mask)/32
                 torch.cuda.empty_cache()
                 loss.backward()
 
@@ -337,6 +356,7 @@ class LoraTrainer:
                         self.model.parameters(), 1)
                     torch.cuda.empty_cache()
                     self.optimizer.step()
+                    scheduler.step()
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
 
@@ -352,15 +372,15 @@ class LoraTrainer:
                             inputs, max_length=1024, do_sample=True,  min_length=100, top_p=0.95, top_k=500, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
                     print(self.tokenizer.decode(token[0]))
 
-                tq.set_description(f"step {step} loss: {loss.item():.5f}")
+                tq.set_description(f"step {step} loss: {loss.item()*32:.5f}")
                 # save to csv
                 path = "loss.csv"
                 if not os.path.exists(path):
                     with open(path, 'w') as f:
-                        f.write(f"{loss}\n")
+                        f.write(f"{loss*32}\n")
                 else:
                     with open(path, 'a') as f:
-                        f.write(f"{loss}\n")
+                        f.write(f"{loss*32}\n")
 
                 step += 1
                 torch.cuda.empty_cache()
@@ -378,9 +398,10 @@ class BatchLabelSmoothingCrossEntropy(nn.Module):
 
     def forward(self, input, target):
         log_prob = F.log_softmax(input, dim=-1)
-        weight = input.new_ones(input.size()) * \
-            self.smoothing / (input.size(-1) - 1.)
-        weight.scatter_(-1, target.unsqueeze(-1), (1. - self.smoothing))
+        weight = (input.new_ones(input.size()) *
+                  self.smoothing / (input.size(-1) - 1.)).detach()
+        weight.scatter_(-1, target.unsqueeze(-1),
+                        (1. - self.smoothing)).detach()
         loss = (-weight * log_prob).sum(dim=-1)
         return loss
 
@@ -407,7 +428,7 @@ class MyLoss(nn.Module):
         loss = loss * (1 - mask_target)
 
         # Create a mask from the input tensor (apply softmax to get probabilities)
-        input_probs = F.softmax(input, dim=-1)
+        input_probs = torch.softmax(input, dim=-1)
         mask_input = (input_probs.argmax(dim=-1) == self.pad_id).float()
 
         # Add a penalty for each mask in the input (predictions)
