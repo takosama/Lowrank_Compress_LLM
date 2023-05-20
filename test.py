@@ -125,19 +125,23 @@ class MyConv1D(nn.Module):
         u, s, v = torch.svd(conv1d.weight)
         transformers.GPT2Model
         # Keep only the top 'rank' components
-        self.wu = nn.Parameter(u[:, : rank] * s[: rank].sqrt())
-        self.wv = nn.Parameter((v[:, : rank] * s[: rank].sqrt()).t())
+        self.wu = nn.Parameter((u[:, : rank] * s[: rank].sqrt()).bfloat16())
+        self.wv = nn.Parameter((
+            (v[:, : rank] * s[: rank].sqrt()).t()).bfloat16())
         self.wu.requires_grad = False
         self.wv.requires_grad = False
 
-        self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2))
-        self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)))
-        torch.nn.init.normal_(self.u, 0, 0.6)
-        torch.nn.init.normal_(self.v, 0, 0.6)
+        self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2).bfloat16())
+        self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)).bfloat16())
+        torch.nn.init.normal_(self.u, 0, 0.8)
+        torch.nn.init.normal_(self.v, 0, 0.8)
         self.u.requires_grad = True
         self.v.requires_grad = True
         self.b = conv1d.bias
         self.b.requires_grad = False
+
+        del conv1d
+        del u, s, v
         return self
 
     def f(self, x):
@@ -162,13 +166,13 @@ class LoraLayer(GPT2Block):
 
         ind, oud = self.attn.c_proj.weight.shape
         self.attn.c_proj = MyConv1D(oud, ind).from_Conv1D(
-            layer.attn.c_proj).to(device).bfloat16()
+            layer.attn.c_proj).to(device)
         self.attn.c_attn = MyConv1D(oud, ind).from_Conv1D(
-            layer.attn.c_attn).to(device).bfloat16()
+            layer.attn.c_attn).to(device)
         self.mlp.c_proj = MyConv1D(oud, ind).from_Conv1D(
-            layer.mlp.c_proj).to(device).bfloat16()
+            layer.mlp.c_proj).to(device)
         self.mlp.c_fc = MyConv1D(oud, ind).from_Conv1D(
-            layer.mlp.c_fc).to(device).bfloat16()
+            layer.mlp.c_fc).to(device)
 
         pass
 
@@ -185,9 +189,9 @@ class LoraManagerbase(AutoModelWithLMHead):
         )
 
         torch.cuda.empty_cache()
-        model.base_model.ln_f = model.base_model.ln_f.bfloat16() .to(device)
-        model.base_model.wte = model.base_model.wte.bfloat16().to(device)
-        model.base_model.wpe = model.base_model.wpe.bfloat16().to(device)
+        model.base_model.ln_f = model.base_model.ln_f .to(device).bfloat16()
+        model.base_model.wte = model.base_model.wte.to(device).bfloat16()
+        model.base_model.wpe = model.base_model.wpe.to(device).bfloat16()
         model.base_model.drop = model.base_model.drop
 
         return model
@@ -307,28 +311,25 @@ class LoraTrainer:
 
         low_path_loss = 0
       #  self.lora_manager.save_pretrained(f"model_epoch_{epoch}")
-        scaler = torch.cuda.amp.GradScaler()
 
         b_Step = 0
+        b_Step = b_Step+1
+
+        # re shuffle to self.dataloader
+        torch.cuda.empty_cache()
+        loss_sum = 0
+        self.optimizer = Lion(
+            self.model.parameters(), lr=1e-4, weight_decay=4e-6)
+        a_rate = 8
+        # dataloaderは訓練データのDataLoaderです
+
+        self.optimizer.zero_grad()
+        h_ = len(self.model.base_model.h)
+        self.model.train()
+
         for epoch in range(epochs):
-            b_Step = b_Step+1
-
-            # re shuffle to self.dataloader
             tq = tqdm(self.dataloader)
-            torch.cuda.empty_cache()
-            loss_sum = 0
-            self.optimizer = Lion(
-                self.model.parameters(), lr=1e-4, weight_decay=4e-5)
-            num_warmup_steps = 10  # warmupステップ数は調整が必要です
-            a_rate = 32
-            # dataloaderは訓練データのDataLoaderです
-            num_training_steps = epochs * len(self.dataloader)/a_rate
 
-            scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer, num_warmup_steps, num_training_steps)
-            self.optimizer.zero_grad()
-            h_ = len(self.model.base_model.h)
-            self.model.train()
             for data in tq:
                 # 学習の処理
                 inputs, labels = data["input_ids"].to(
@@ -340,7 +341,8 @@ class LoraTrainer:
                 # with autocast(device_type="cuda"):
                 past_key_values = None
                 torch.cuda.empty_cache()
-                lora_outputs = self.model(
+
+                lora_outputs = self. model(
                     inputs, attention_mask=attention_mask, labels=labels)
                 torch.cuda.empty_cache()
 
@@ -355,7 +357,6 @@ class LoraTrainer:
                         self.model.parameters(), 1)
                     torch.cuda.empty_cache()
                     self.optimizer.step()
-                    scheduler.step()
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
 
@@ -372,20 +373,20 @@ class LoraTrainer:
                     print(self.tokenizer.decode(token[0]))
 
                 tq.set_description(
-                    f"step {step} loss: {loss.item()*a_rate:.5f}")
+                    f"step {step} loss: {loss.item()*a_rate :.5f}")
                 # save to csv
                 path = "loss.csv"
                 if not os.path.exists(path):
                     with open(path, 'w') as f:
-                        f.write(f"{loss*a_rate}\n")
+                        f.write(f"{loss*a_rate }\n")
                 else:
                     with open(path, 'a') as f:
-                        f.write(f"{loss*a_rate}\n")
+                        f.write(f"{loss*a_rate }\n")
 
                 step += 1
                 torch.cuda.empty_cache()
 
-            print(f"epoch {epoch} loss: {loss_sum/step:.5f}")
+            print(f"epoch {epoch} loss: {loss_sum/step :.5f}")
             # save
             self.model.save_pretrained(f"model_train_epoch_{epoch}")
             torch.cuda.empty_cache()
@@ -407,7 +408,7 @@ class BatchLabelSmoothingCrossEntropy(nn.Module):
 
 
 class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.1, mask_penalty=0.1):
+    def __init__(self, label_smoothing=0.03, mask_penalty=0.01):
         super().__init__()
         self.pad_id = 3
         self.mask_penalty = mask_penalty
