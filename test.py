@@ -79,7 +79,7 @@ class Swish(nn.Module):
         self.e = nn.Parameter(torch.randn(size))
         self.a = nn.Parameter(torch.randn(size))
         torch.nn.init.normal_(self.e, 0, 0.1)
-        torch.nn.init.normal_(self.a, 0, 0.1)
+        torch.nn.init.normal_(self.a, 0, 1)
 
     def f(self, x):
         return torch.mul(x,  torch.sigmoid((x+self.e)*self.a))
@@ -143,9 +143,9 @@ class MyConv1D(nn.Module):
         x = x.softmax(-1)
         x = torch.addmm(self.b, x.view(-1, x.size(-1)),
                         torch.add(
-            self.act(
-                self.u)
-            @ self.act2(self.v), self.wu@self.wv))
+
+            self.u
+            @ self.v, self.wu@self.wv))
         x = x.view(size_out)
         torch.cuda.empty_cache()
         return x
@@ -319,10 +319,11 @@ class LoraTrainer:
             torch.cuda.empty_cache()
             loss_sum = 0
             self.optimizer = Lion(
-                self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+                self.model.parameters(), lr=6e-4, weight_decay=1e-4)
             num_warmup_steps = 10  # warmupステップ数は調整が必要です
+            a_rate = 16
             # dataloaderは訓練データのDataLoaderです
-            num_training_steps = epochs * len(self.dataloader)/32
+            num_training_steps = epochs * len(self.dataloader)/a_rate
 
             scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer, num_warmup_steps, num_training_steps)
@@ -346,12 +347,12 @@ class LoraTrainer:
                 torch.cuda.empty_cache()
 
                 loss = lora_outputs["logits"]
-                loss = criterion(loss, labels, attention_mask)/32
+                loss = criterion(loss, labels, attention_mask)/a_rate
                 torch.cuda.empty_cache()
                 loss.backward()
 
                 torch.cuda.empty_cache()
-                if (step+1) % 32 == 0:
+                if (step+1) % a_rate == 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 1)
                     torch.cuda.empty_cache()
@@ -372,15 +373,16 @@ class LoraTrainer:
                             inputs, max_length=1024, do_sample=True,  min_length=100, top_p=0.95, top_k=500, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
                     print(self.tokenizer.decode(token[0]))
 
-                tq.set_description(f"step {step} loss: {loss.item()*32:.5f}")
+                tq.set_description(
+                    f"step {step} loss: {loss.item()*a_rate:.5f}")
                 # save to csv
                 path = "loss.csv"
                 if not os.path.exists(path):
                     with open(path, 'w') as f:
-                        f.write(f"{loss*32}\n")
+                        f.write(f"{loss*a_rate}\n")
                 else:
                     with open(path, 'a') as f:
-                        f.write(f"{loss*32}\n")
+                        f.write(f"{loss*a_rate}\n")
 
                 step += 1
                 torch.cuda.empty_cache()
