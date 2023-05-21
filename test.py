@@ -52,8 +52,8 @@ class QADataset(Dataset):
             in_ = str.lower(in_)
             out = d["response"]
             out = str.lower(out)
-            question = f"h[SEP]{instruction}[SEP]{in_}[SEP]"
-            answer = f"a[SEP]{out}</s>"
+            question = f"///instruction//{instruction}[SEP]///context//{in_}</s>"
+            answer = f"///response//{out}</s>"
 
             # self.tokenizer.pad_token_idv
 
@@ -104,7 +104,7 @@ class MyConv1D(nn.Module):
         super().__init__()
         self.nf = nf
         rank = 256
-        rank2 = 256
+        rank2 = 16
         self.u = nn.Parameter(torch.zeros(
             nf, rank2))
         self.v = nn.Parameter(torch.zeros(
@@ -133,8 +133,8 @@ class MyConv1D(nn.Module):
 
         self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2).bfloat16())
         self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)).bfloat16())
-        torch.nn.init.normal_(self.u, 0, 0.8)
-        torch.nn.init.normal_(self.v, 0, 0.8)
+        torch.nn.init.normal_(self.u, 0, 0.02)
+        torch.nn.init.normal_(self.v, 0, 0.02)
         self.u.requires_grad = True
         self.v.requires_grad = True
         self.b = conv1d.bias
@@ -155,6 +155,8 @@ class MyConv1D(nn.Module):
 
     def forward(self, x):
         output = checkpoint(self.f, x)
+        torch.clamp(self.u, -1, 1)
+        torch.clamp(self.v, -1, 1)
         return output
 
 
@@ -319,8 +321,8 @@ class LoraTrainer:
         torch.cuda.empty_cache()
         loss_sum = 0
         self.optimizer = Lion(
-            self.model.parameters(), lr=1e-4, weight_decay=4e-6)
-        a_rate = 8
+            self.model.parameters(), lr=6e-4, weight_decay=1e-4)
+        a_rate = 16
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
@@ -353,8 +355,6 @@ class LoraTrainer:
 
                 torch.cuda.empty_cache()
                 if (step+1) % a_rate == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 1)
                     torch.cuda.empty_cache()
                     self.optimizer.step()
                     torch.cuda.empty_cache()
@@ -365,15 +365,13 @@ class LoraTrainer:
                     inputs = inputs[0].squeeze(0).unsqueeze(0)
                     # paddingを削除
                     inputs = inputs[inputs != 3].unsqueeze(0)
-                    # eosを削除
-                    inputs = inputs[inputs != 2].unsqueeze(0)
                     with torch.no_grad():
                         token = self.model.generate(
                             inputs, max_length=1024, do_sample=True,  min_length=100, top_p=0.95, top_k=500, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
                     print(self.tokenizer.decode(token[0]))
 
                 tq.set_description(
-                    f"step {step} loss: {loss.item()*a_rate :.5f}")
+                    f"step {step} loss: {loss.item()*a_rate:.5f}")
                 # save to csv
                 path = "loss.csv"
                 if not os.path.exists(path):
@@ -393,7 +391,7 @@ class LoraTrainer:
 
 
 class BatchLabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing=0.1):
+    def __init__(self, smoothing):
         super(BatchLabelSmoothingCrossEntropy, self).__init__()
         self.smoothing = smoothing
 
@@ -408,7 +406,7 @@ class BatchLabelSmoothingCrossEntropy(nn.Module):
 
 
 class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.03, mask_penalty=0.01):
+    def __init__(self, label_smoothing=0.1, mask_penalty=0.01):
         super().__init__()
         self.pad_id = 3
         self.mask_penalty = mask_penalty
