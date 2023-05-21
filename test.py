@@ -14,7 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from transformers import AutoModelWithLMHead, AutoConfig
+from transformers import AutoModelWithLMHead, AutoConfig 
+from transformers import T5Tokenizer
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, PreTrainedModel
@@ -104,7 +105,7 @@ class MyConv1D(nn.Module):
         super().__init__()
         self.nf = nf
         rank = 256
-        rank2 = 16
+        rank2 = 256
         self.u = nn.Parameter(torch.zeros(
             nf, rank2))
         self.v = nn.Parameter(torch.zeros(
@@ -133,8 +134,8 @@ class MyConv1D(nn.Module):
 
         self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2).bfloat16())
         self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)).bfloat16())
-        torch.nn.init.normal_(self.u, 0, 0.5)
-        torch.nn.init.normal_(self.v, 0, 0.5)
+        torch.nn.init.normal_(self.u, 0, 0.01)
+        torch.nn.init.normal_(self.v, 0, 0.01)
         self.u.requires_grad = True
         self.v.requires_grad = True
         self.b = conv1d.bias
@@ -150,7 +151,6 @@ class MyConv1D(nn.Module):
         x = torch.addmm(self.b, x.view(-1, x.size(-1)),
                         torch.add(self.u @ self.v, (self.wu@self.wv).detach()))
         x = x.view(size_out)
-        torch.cuda.empty_cache()
         return x
 
     def forward(self, x):
@@ -264,23 +264,20 @@ class LoraManagerbase(AutoModelWithLMHead):
 class LoraTrainer:
 
     def __init__(self,   rank):
+        tokenizer = transformers.AutoTokenizer.from_pretrained('rinna/japanese-gpt2-small', use_fast=False)
+     
         torch.cuda.empty_cache()
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
 
-        self.    model = LoraManagerbase.from_pretrained(
-            "rinna/japanese-gpt2-small", self. device, rank=rank)
-        self.    model.save_pretrained("test")
-        torch.cuda.empty_cache()
+        self.    model = LoraManagerbase.from_pretrained('rinna/japanese-gpt2-small', self. device, rank=rank)
 
-        self.rank = rank
+        self.tokenizer=tokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "rinna/japanese-gpt2-medium", use_fast=False)
         self.tokenizer.sep_token = self.tokenizer.eos_token
 
         # データを整形
-        with open('/home/rintya/rinnna_loader/databricks-dolly-15k-translated14801_14900.json', 'r', encoding="utf-8") as f:
+        with open('databricks-dolly-15k-translated14801_14900.json', 'r', encoding="utf-8") as f:
             data = json.load(f)
 
         # unicodeエスケープを解除
@@ -293,7 +290,7 @@ class LoraTrainer:
             da.append(p)
         # 保存
         with open('databricks-dolly-15k-translated.json', 'w', encoding="utf-8") as f:
-            json.dump(da, f, ensure_ascii=False, indent=4)
+            json.dump(da, f, ensure_ascii=False, indent=6)
 
         # data を128の倍数に切り捨て
         data = data[:len(data)//128*128]
@@ -302,7 +299,7 @@ class LoraTrainer:
         dataset = QADataset(random.sample(data, len(data)),
                             self.tokenizer, max_length=1024)
 
-        self.dataloader = DataLoader(dataset, batch_size=2,   shuffle=True)
+        self.dataloader = DataLoader(dataset, batch_size=6,   shuffle=True)
 
     def train(self, epochs, criterion):
         # save
@@ -321,8 +318,8 @@ class LoraTrainer:
         torch.cuda.empty_cache()
         loss_sum = 0
         self.optimizer = Lion(
-            self.model.parameters(), lr=1e-4, weight_decay=1e-4)
-        a_rate = 8
+            self.model.parameters(), lr=6e-4, weight_decay=1e-4)
+        a_rate = 2
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
@@ -342,23 +339,18 @@ class LoraTrainer:
                 attention_mask = attention_mask
                 # with autocast(device_type="cuda"):
                 past_key_values = None
-                torch.cuda.empty_cache()
+   
 
                 lora_outputs = self. model(
                     inputs, attention_mask=attention_mask, labels=labels)
-                torch.cuda.empty_cache()
-
+             
                 loss = lora_outputs["logits"]
                 loss = criterion(loss, labels, attention_mask)/a_rate
-                torch.cuda.empty_cache()
                 loss = loss.mean()
                 loss.backward()
 
-                torch.cuda.empty_cache()
                 if (step+1) % a_rate == 0:
-                    torch.cuda.empty_cache()
                     self.optimizer.step()
-                    torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
 
                 if (step+1) % (4*64) == 0 or step == 0:
@@ -384,7 +376,6 @@ class LoraTrainer:
                         f.write(f"{loss*a_rate }\n")
 
                 step += 1
-                torch.cuda.empty_cache()
 
             print(f"epoch {epoch} loss: {loss_sum/step :.5f}")
             # save
@@ -452,8 +443,7 @@ def main():
     print("Training completed")
 
 
-if __name__ == "__main__":
-    # debug cuda
-    torch.backends.cudnn.deterministic = True
-    torch.autograd.set_detect_anomaly(True)
+if __name__ == "__main__": 
+    tokenizer = transformers.AutoTokenizer.from_pretrained('rinna/japanese-gpt2-small', use_fast=False)
+     
     main()
