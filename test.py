@@ -52,7 +52,7 @@ class QADataset(Dataset):
             in_ = str.lower(in_)
             out = d["response"]
             out = str.lower(out)
-            question = f"///instruction//{instruction}[SEP]///context//{in_}</s>"
+            question = f"///instruction//{instruction}[SEP]///context//{in_}[SEP]"
             answer = f"///response//{out}</s>"
 
             # self.tokenizer.pad_token_idv
@@ -133,8 +133,8 @@ class MyConv1D(nn.Module):
 
         self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2).bfloat16())
         self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)).bfloat16())
-        torch.nn.init.normal_(self.u, 0, 0.02)
-        torch.nn.init.normal_(self.v, 0, 0.02)
+        torch.nn.init.normal_(self.u, 0, 0.5)
+        torch.nn.init.normal_(self.v, 0, 0.5)
         self.u.requires_grad = True
         self.v.requires_grad = True
         self.b = conv1d.bias
@@ -269,7 +269,7 @@ class LoraTrainer:
             "cuda:0" if torch.cuda.is_available() else "cpu")
 
         self.    model = LoraManagerbase.from_pretrained(
-            "rinna/japanese-gpt2-medium", self. device, rank=rank)
+            "rinna/japanese-gpt2-small", self. device, rank=rank)
         self.    model.save_pretrained("test")
         torch.cuda.empty_cache()
 
@@ -302,7 +302,7 @@ class LoraTrainer:
         dataset = QADataset(random.sample(data, len(data)),
                             self.tokenizer, max_length=1024)
 
-        self.dataloader = DataLoader(dataset, batch_size=1,   shuffle=True)
+        self.dataloader = DataLoader(dataset, batch_size=2,   shuffle=True)
 
     def train(self, epochs, criterion):
         # save
@@ -321,8 +321,8 @@ class LoraTrainer:
         torch.cuda.empty_cache()
         loss_sum = 0
         self.optimizer = Lion(
-            self.model.parameters(), lr=6e-4, weight_decay=1e-4)
-        a_rate = 16
+            self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+        a_rate = 8
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
@@ -351,6 +351,7 @@ class LoraTrainer:
                 loss = lora_outputs["logits"]
                 loss = criterion(loss, labels, attention_mask)/a_rate
                 torch.cuda.empty_cache()
+                loss = loss.mean()
                 loss.backward()
 
                 torch.cuda.empty_cache()
@@ -365,6 +366,7 @@ class LoraTrainer:
                     inputs = inputs[0].squeeze(0).unsqueeze(0)
                     # paddingを削除
                     inputs = inputs[inputs != 3].unsqueeze(0)
+                    inputs = inputs[inputs != 2].unsqueeze(0)
                     with torch.no_grad():
                         token = self.model.generate(
                             inputs, max_length=1024, do_sample=True,  min_length=100, top_p=0.95, top_k=500, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
@@ -431,7 +433,8 @@ class MyLoss(nn.Module):
         mask_input = (input_probs.argmax(dim=-1) == self.pad_id).float()
 
         # Add a penalty for each mask in the input (predictions)
-        loss = loss.sum()/mask_target2.sum() + self.mask_penalty * torch.sum(mask_input)
+        loss = loss.sum(-1)/mask_target2.sum(-1) + \
+            self.mask_penalty * mask_input.sum(-1)
 
         return loss
 
