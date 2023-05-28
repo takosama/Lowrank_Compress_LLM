@@ -59,9 +59,9 @@ class QADataset(Dataset):
             # self.tokenizer.pad_token_idv
 
             input_ids = self.tokenizer.encode(question, truncation=True,
-                                              max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=False)
+                                              max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=True)
             target_ids = self. tokenizer.encode(answer, truncation=True,
-                                                max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=False)
+                                                max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=True)
             # 4 padを0にする
             attention_mask = (input_ids != 3).long()
             # 次元を落とす
@@ -77,7 +77,7 @@ class QADataset(Dataset):
 class MyModule(nn.Module):
 
     def __init__(self):
-        self.rank = 256
+        self.rank = 512
         super().__init__()
 
     def from_Conv1D(self, w):
@@ -87,14 +87,27 @@ class MyModule(nn.Module):
         S = torch.diag(S[:self.rank])
         U = U[:, :self.rank]
         V = V[:, :self.rank]
-        self.U = nn.Parameter(U)
-        self.S = nn.Parameter(S)
-        self.V = nn.Parameter(V)
+        self.U = nn.Parameter(U.bfloat16())
+        self.V = nn.Parameter(V.bfloat16())
+        self.S = nn.Parameter(S.bfloat16())
+        self.U.requires_grad = False
+        self.V.requires_grad = False
+        self.S.requires_grad = False
+
         self.w.weight = nn.Parameter(torch.zeros(1))
+        size = self.w.weight.size()
+        self.uw = torch.zeros((size[0], 16))
+        self.uv = torch.zeros((16, size[1]))
+        self.uw = nn.Parameter(self.uw)
+        self.uv = nn.Parameter(self.uv)
+        self.uw.requires_grad = False
+        self.uv.requires_grad = False
+
         return self
 
     def forward(self, x):
-        self.w.weight = nn.Parameter(self.U @ self.S @ self.V.t())
+        self.w.weight = nn.Parameter(
+            (self.U @ self.S @ self.V.t()).detach()+self.uw@self.uv)
         ret = self.w(x)
         return ret
 
@@ -234,9 +247,9 @@ class LoraTrainer:
         # re shuffle to self.dataloader
         torch.cuda.empty_cache()
         loss_sum = 0
-        a_rate = 8
+        a_rate = 4
         self.optimizer = Lion(
-            self.model.parameters(), lr=5e-5, weight_decay=5e-3)
+            self.model.parameters(), lr=6e-4, weight_decay=5e-5)
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
