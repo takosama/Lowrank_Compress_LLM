@@ -94,14 +94,15 @@ class MyModule(nn.Module):
         self.V.requires_grad = False
         self.S.requires_grad = False
 
-        self.w.weight = nn.Parameter(torch.zeros(1))
         size = self.w.weight.size()
         self.uw = torch.zeros((size[0], 16))
         self.uv = torch.zeros((16, size[1]))
         self.uw = nn.Parameter(self.uw)
         self.uv = nn.Parameter(self.uv)
-        self.uw.requires_grad = False
-        self.uv.requires_grad = False
+        self.uw.requires_grad = True
+        self.uv.requires_grad = True
+
+        self.w.weight = nn.Parameter(torch.zeros(1))
 
         return self
 
