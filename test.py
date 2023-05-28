@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from transformers import AutoModelWithLMHead, AutoConfig 
+from transformers import AutoModelWithLMHead, AutoConfig
 from transformers import T5Tokenizer
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -74,172 +74,63 @@ class QADataset(Dataset):
             return {"input_ids": torch.zeros(self.max_length).int(), "attention_mask": torch.zeros(self.max_length).int(), "labels": torch.zeros(self.max_length).int()}
 
 
-class Swish(nn.Module):
-    def __init__(self, size):
-        super(Swish, self).__init__()
-        self.e = nn.Parameter(torch.randn(size))
-        self.a = nn.Parameter(torch.randn(size))
-        torch.nn.init.normal_(self.e, 0, 0.1)
-        torch.nn.init.normal_(self.a, 0, 1)
+class MyModule(nn.Module):
 
-    def f(self, x):
-        return torch.mul(x,  torch.sigmoid((x+self.e)*self.a))
-
-    def forward(self, x):
-        output = checkpoint(self.f, x)
-        return output
-
-
-class MyConv1D(nn.Module):
-    """
-    1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
-
-    Basically works like a linear layer but the weights are transposed.
-
-    Args:
-        nf (`int`): The number of output features.
-        nx (`int`): The number of input features.
-    """
-
-    def __init__(self, nf, nx):
+    def __init__(self):
+        self.rank = 256
         super().__init__()
-        self.nf = nf
-        rank = 256
-        rank2 = 256
-        self.u = nn.Parameter(torch.zeros(
-            nf, rank2))
-        self.v = nn.Parameter(torch.zeros(
-            rank2, nx))
-        self.wu = nn.Parameter(torch.zeros(
-            nf, rank))
-        self.wv = nn.Parameter(torch.zeros(
-            rank, nx))
-        self.b = nn.Parameter(torch.zeros(nf))
 
-    def from_Conv1D(self, conv1d: nn.Module):
-        self.nf = conv1d.nf
-        rank = 256
-        rank2 = 256
-        # rank分解を行う
+    def from_Conv1D(self, w):
+        self.w = w
 
-        # Perform SVD
-        u, s, v = torch.svd(conv1d.weight)
-        transformers.GPT2Model
-        # Keep only the top 'rank' components
-        self.wu = nn.Parameter((u[:, : rank] * s[: rank].sqrt()).bfloat16())
-        self.wv = nn.Parameter((
-            (v[:, : rank] * s[: rank].sqrt()).t()).bfloat16())
-        self.wu.requires_grad = False
-        self.wv.requires_grad = False
-
-        self.u = nn.Parameter(torch.zeros(self.wu.size(0), rank2).bfloat16())
-        self.v = nn.Parameter(torch.zeros(rank2, self.wv.size(1)).bfloat16())
-        torch.nn.init.normal_(self.u, 0, 0.01)
-        torch.nn.init.normal_(self.v, 0, 0.01)
-        self.u.requires_grad = True
-        self.v.requires_grad = True
-        self.b = conv1d.bias
-        self.b.requires_grad = False
-
-        del conv1d
-        del u, s, v
+        U, S, V = torch.svd(w.weight.data)
+        S = torch.diag(S[:self.rank])
+        U = U[:, :self.rank]
+        V = V[:, :self.rank]
+        self.U = nn.Parameter(U)
+        self.S = nn.Parameter(S)
+        self.V = nn.Parameter(V)
+        self.w.weight = nn.Parameter(torch.zeros(1))
         return self
 
-    def f(self, x):
-        size_out = x.size()[:-1] + (self.nf,)
-        x = x.softmax(-1)
-        x = torch.addmm(self.b, x.view(-1, x.size(-1)),
-                        torch.add(self.u @ self.v, (self.wu@self.wv).detach()))
-        x = x.view(size_out)
-        return x
-
     def forward(self, x):
-        output = checkpoint(self.f, x)
-        torch.clamp(self.u, -1, 1)
-        torch.clamp(self.v, -1, 1)
-        return output
+        self.w.weight = nn.Parameter(self.U @ self.S @ self.V.t())
+        ret = self.w(x)
+        return ret
 
 
 class LoraLayer(GPT2Block):
-    def __init__(self, layer: nn.Module,  model: GPT2LMHeadModel, rank, i, device):
-        config = model
-        super().__init__(config)
-        del config
+    @staticmethod
+    def set(layer: nn.Module):
+        size = layer.attn.c_attn.weight.size()
+        layer.attn.c_attn = MyModule().from_Conv1D(layer.attn.c_attn)
+        layer.attn.c_proj = MyModule().from_Conv1D(layer.attn.c_proj)
 
-        ind, oud = self.attn.c_proj.weight.shape
-        self.attn.c_proj = MyConv1D(oud, ind).from_Conv1D(
-            layer.attn.c_proj).to(device)
-        self.attn.c_attn = MyConv1D(oud, ind).from_Conv1D(
-            layer.attn.c_attn).to(device)
-        self.mlp.c_proj = MyConv1D(oud, ind).from_Conv1D(
-            layer.mlp.c_proj).to(device)
-        self.mlp.c_fc = MyConv1D(oud, ind).from_Conv1D(
-            layer.mlp.c_fc).to(device)
+        layer.mlp.c_fc = MyModule().from_Conv1D(layer.mlp.c_fc)
+        layer.mlp.c_proj = MyModule().from_Conv1D(layer.mlp.c_proj)
 
-        pass
+        return layer
 
 
 class LoraManagerbase(AutoModelWithLMHead):
-    def __init__(self,     config, rank):
+    def __init__(self, config, rank):
         super().__init__(config=config)
 
     @classmethod
     def SetUp(self, model, rank, device):
-
         model.base_model.h = nn.ModuleList(
-            LoraLayer(model.base_model.h[i], model.config, rank, i, device).cuda().bfloat16() for i in range(len(model.base_model.h.cuda()))
+            [LoraLayer.set(layer.to(device))
+             for layer in model.base_model.h]
         )
 
         torch.cuda.empty_cache()
-        model.base_model.ln_f = model.base_model.ln_f .to(device).bfloat16()
-        model.base_model.wte = model.base_model.wte.to(device).bfloat16()
-        model.base_model.wpe = model.base_model.wpe.to(device).bfloat16()
+        model.base_model.ln_f = model.base_model.ln_f .to(device)
+        model.base_model.wte = model.base_model.wte.to(device)
+        model.base_model.wpe = model.base_model.wpe.to(device)
         model.base_model.drop = model.base_model.drop
 
         return model
 
-    def forward(self, *args: any, **kwds: any) -> any:
-        r = super().forward(*args, **kwds)
-        print(r)
-        return r
-
- # @ classmethod
- # def Set_Train_Layer(cls, model, l):
-   #     on = [23, 22, 21, 20, 19, 18, 17, 16, 15,
-   #           14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
-   #     components = ['mlp.c_fc', 'mlp.c_proj',
-   #                   'attn.c_attn', 'attn.c_proj']
-   #     params = ['u', 'v', "b"]
-#
-   #     def init_weights(model, layer, components, params):
-   #         for component in components:
-   #             component_parts = component.split('.')
-   #             target = model.base_model.h[layer]
-   #             for part in component_parts:
-   #                 target = getattr(target, part)
-   #             for param in params:
-   #                 torch.nn.init.normal_(getattr(target, param), 0, 0.2)
-#
-   #                 getattr(target, param).requires_grad = True
-#
-   #     def init_weights2(model, layer, components, params):
-   #         for component in components:
-   #             component_parts = component.split('.')
-   #             target = model.base_model.h[layer]
-   #             for part in component_parts:
-   #                 target = getattr(target, part)
-   #             for param in params:
-   #                 getattr(target, param).requires_grad = False
-#
-   #     for i in on:
-   #         init_weights(model, i, components, params)
-#
-   #     for i in range(len(model.base_model.h)):
-   #         if i not in on:
-   #             init_weights2(model, i, components, params)
-#
-   #     return model
-##
     @ classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, device, *model_args, **kwargs):
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
@@ -264,20 +155,46 @@ class LoraManagerbase(AutoModelWithLMHead):
 class LoraTrainer:
 
     def __init__(self,   rank):
-        tokenizer = transformers.AutoTokenizer.from_pretrained('rinna/japanese-gpt2-small', use_fast=False)
-     
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            'rinna/japanese-gpt2-small', use_fast=False)
+
         torch.cuda.empty_cache()
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
+        self.model = GPT2LMHeadModel.from_pretrained(
+            'rinna/japanese-gpt2-small').to(self.device)
+        token = tokenizer.encode("こんにちは", return_tensors="pt").to(self.device)
+        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
+                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+        print(tokenizer.decode(res[0]))
+        print("------------------------")
+        print(tokenizer.decode(res[1]))
+        print("------------------------")
+        print(tokenizer.decode(res[2]))
+        print("------------------------")
 
-        self.    model = LoraManagerbase.from_pretrained('rinna/japanese-gpt2-small', self. device, rank=rank)
+        print()
+        print()
 
-        self.tokenizer=tokenizer
+        self.    model = LoraManagerbase.from_pretrained(
+            'rinna/japanese-gpt2-small', self. device, rank=rank).to(self.device).bfloat16()
+        self.model.save_pretrained("test")
+
+        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
+                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+        print(tokenizer.decode(res[0]))
+        print("------------------------")
+        print(tokenizer.decode(res[1]))
+        print("------------------------")
+        print(tokenizer.decode(res[2]))
+        print("------------------------")
+
+        self.tokenizer = tokenizer
 
         self.tokenizer.sep_token = self.tokenizer.eos_token
 
         # データを整形
-        with open('databricks-dolly-15k-translated14801_14900.json', 'r', encoding="utf-8") as f:
+        with open('rinnna_loader/databricks-dolly-15k-translated14801_14900.json', 'r', encoding="utf-8") as f:
             data = json.load(f)
 
         # unicodeエスケープを解除
@@ -290,7 +207,7 @@ class LoraTrainer:
             da.append(p)
         # 保存
         with open('databricks-dolly-15k-translated.json', 'w', encoding="utf-8") as f:
-            json.dump(da, f, ensure_ascii=False, indent=6)
+            json.dump(da, f, ensure_ascii=False, indent=4)
 
         # data を128の倍数に切り捨て
         data = data[:len(data)//128*128]
@@ -299,7 +216,7 @@ class LoraTrainer:
         dataset = QADataset(random.sample(data, len(data)),
                             self.tokenizer, max_length=1024)
 
-        self.dataloader = DataLoader(dataset, batch_size=6,   shuffle=True)
+        self.dataloader = DataLoader(dataset, batch_size=2,   shuffle=True)
 
     def train(self, epochs, criterion):
         # save
@@ -317,9 +234,9 @@ class LoraTrainer:
         # re shuffle to self.dataloader
         torch.cuda.empty_cache()
         loss_sum = 0
+        a_rate = 8
         self.optimizer = Lion(
-            self.model.parameters(), lr=6e-4, weight_decay=1e-4)
-        a_rate = 2
+            self.model.parameters(), lr=5e-5, weight_decay=5e-3)
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
@@ -339,18 +256,24 @@ class LoraTrainer:
                 attention_mask = attention_mask
                 # with autocast(device_type="cuda"):
                 past_key_values = None
-   
+                torch.cuda.empty_cache()
 
                 lora_outputs = self. model(
                     inputs, attention_mask=attention_mask, labels=labels)
-             
+
+                torch.cuda.empty_cache()
+
                 loss = lora_outputs["logits"]
-                loss = criterion(loss, labels, attention_mask)/a_rate
+                loss = criterion(loss, labels, inputs, attention_mask)/a_rate
+                torch.cuda.empty_cache()
                 loss = loss.mean()
                 loss.backward()
 
+                torch.cuda.empty_cache()
                 if (step+1) % a_rate == 0:
+                    torch.cuda.empty_cache()
                     self.optimizer.step()
+                    torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
 
                 if (step+1) % (4*64) == 0 or step == 0:
@@ -358,11 +281,17 @@ class LoraTrainer:
                     inputs = inputs[0].squeeze(0).unsqueeze(0)
                     # paddingを削除
                     inputs = inputs[inputs != 3].unsqueeze(0)
-                    inputs = inputs[inputs != 2].unsqueeze(0)
+
                     with torch.no_grad():
                         token = self.model.generate(
-                            inputs, max_length=1024, do_sample=True,  min_length=100, top_p=0.95, top_k=500, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
+                            inputs, max_length=1024, do_sample=True,  top_k=500, top_p=0.8, num_return_sequences=3, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
+                    print("--------------------")
                     print(self.tokenizer.decode(token[0]))
+                    print("--------------------")
+                    print(self.tokenizer.decode(token[1]))
+                    print("--------------------")
+                    print(self.tokenizer.decode(token[2]))
+                    print("--------------------")
 
                 tq.set_description(
                     f"step {step} loss: {loss.item()*a_rate:.5f}")
@@ -376,6 +305,7 @@ class LoraTrainer:
                         f.write(f"{loss*a_rate }\n")
 
                 step += 1
+                torch.cuda.empty_cache()
 
             print(f"epoch {epoch} loss: {loss_sum/step :.5f}")
             # save
@@ -399,35 +329,39 @@ class BatchLabelSmoothingCrossEntropy(nn.Module):
 
 
 class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.1, mask_penalty=0.01):
+    def __init__(self, label_smoothing=0.2, mask_penalty=0.5):
         super().__init__()
         self.pad_id = 3
         self.mask_penalty = mask_penalty
         self.l = BatchLabelSmoothingCrossEntropy(label_smoothing)
 
-    def forward(self, input, target, attention_mask=None):
+    def forward(self, input, target, attention_mask=None, target2=None):
         batch_size, sequence_length, num_classes = input.size()
 
         # Create a mask from the target tensor
         mask_target = (target == self.pad_id).float()
+        mask_target3 = (target == 2).float()
         mask_target2 = (target != self.pad_id).float()
 
         loss = self.l(input.view(-1, num_classes), target.view(-1)
                       ).view(batch_size, sequence_length)
+        # target2 とtargetをone hotにする
 
         # Zero out the loss where the target is a pad token
         # Note the "1 - mask_target"
         loss = loss * (1 - mask_target)
+        loss = loss * (1 - mask_target3)
 
         # Create a mask from the input tensor (apply softmax to get probabilities)
-        input_probs = torch.softmax(input, dim=-1)
+        input_probs = torch.softmax(input, dim=1)
         mask_input = (input_probs.argmax(dim=-1) == self.pad_id).float()
-
+        mask_input2 = (input_probs.argmax(dim=-1) == 2).float()
         # Add a penalty for each mask in the input (predictions)
         loss = loss.sum(-1)/mask_target2.sum(-1) + \
-            self.mask_penalty * mask_input.sum(-1)
+            self.mask_penalty * \
+            mask_input.sum(-1)+self.mask_penalty * mask_input2.sum(-1)
 
-        return loss
+        return loss*100
 
 
 def main():
@@ -443,7 +377,8 @@ def main():
     print("Training completed")
 
 
-if __name__ == "__main__": 
-    tokenizer = transformers.AutoTokenizer.from_pretrained('rinna/japanese-gpt2-small', use_fast=False)
-     
+if __name__ == "__main__":
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        'rinna/japanese-gpt2-small', use_fast=False)
+
     main()
