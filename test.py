@@ -77,8 +77,14 @@ class QADataset(Dataset):
 class MyModule(nn.Module):
 
     def __init__(self):
-        self.rank = 512
         super().__init__()
+
+        self.rank = 512
+        self.uw = nn.Parameter(torch.zeros(1))
+        self.uv = nn.Parameter(torch.zeros(1))
+        self.U = nn.Parameter(torch.zeros(1))
+        self.V = nn.Parameter(torch.zeros(1))
+        self.S = nn.Parameter(torch.zeros(1))
 
     def from_Conv1D(self, w):
         self.w = w
@@ -95,10 +101,8 @@ class MyModule(nn.Module):
         self.S.requires_grad = False
 
         size = self.w.weight.size()
-        self.uw = torch.zeros((size[0], 16))
-        self.uv = torch.zeros((16, size[1]))
-        self.uw = nn.Parameter(self.uw)
-        self.uv = nn.Parameter(self.uv)
+        self.uw = nn.Parameter(torch.zeros((size[0], 16)))
+        self.uv = nn.Parameter(torch.zeros((16, size[1])))
         self.uw.requires_grad = True
         self.uv.requires_grad = True
 
