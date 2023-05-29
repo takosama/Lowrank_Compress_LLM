@@ -74,58 +74,58 @@ class QADataset(Dataset):
             return {"input_ids": torch.zeros(self.max_length).int(), "attention_mask": torch.zeros(self.max_length).int(), "labels": torch.zeros(self.max_length).int()}
 
 
-class MyModule(nn.Module):
+class MyConv1D(nn.Module):
+    """
+    1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
 
-    def __init__(self):
+    Basically works like a linear layer but the weights are transposed.
+
+    Args:
+        nf (`int`): The number of output features.
+        nx (`int`): The number of input features.
+    """
+
+    def __init__(self, nf, nx):
         super().__init__()
-
-        self.rank = 512
-        self.uw = nn.Parameter(torch.zeros(1))
-        self.uv = nn.Parameter(torch.zeros(1))
-        self.U = nn.Parameter(torch.zeros(1))
-        self.V = nn.Parameter(torch.zeros(1))
-        self.S = nn.Parameter(torch.zeros(1))
-
-    def from_Conv1D(self, w):
-        self.w = w
-
-        U, S, V = torch.svd(w.weight.data)
-        S = torch.diag(S[:self.rank])
-        U = U[:, :self.rank]
-        V = V[:, :self.rank]
-        self.U = nn.Parameter(U.bfloat16())
-        self.V = nn.Parameter(V.bfloat16())
-        self.S = nn.Parameter(S.bfloat16())
-        self.U.requires_grad = False
-        self.V.requires_grad = False
-        self.S.requires_grad = False
-
-        size = self.w.weight.size()
-        self.uw = nn.Parameter(torch.zeros((size[0], 16)))
-        self.uv = nn.Parameter(torch.zeros((16, size[1])))
-        self.uw.requires_grad = True
-        self.uv.requires_grad = True
-
-        self.w.weight = nn.Parameter(torch.zeros(1))
-
-        return self
+        self.nf = nf
+        self.weight = nn.Parameter(torch.empty(nx, nf))
+        self.bias = nn.Parameter(torch.zeros(nf))
+        nn.init.normal_(self.weight, std=0.02)
 
     def forward(self, x):
-        self.w.weight = nn.Parameter(
-            (self.U @ self.S @ self.V.t()).detach()+self.uw@self.uv)
-        ret = self.w(x)
-        return ret
+        size_out = x.size()[:-1] + (self.nf,)
+        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        x = x.view(size_out)
+        return x
+
+
+class MyModule(nn.Module):
+    def __init__(self, w):
+        super().__init__()
+        self.rank = 512
+        size = w.size()
+        self.myfunc = MyConv1D(size[0], size[1])
+        self.myfunc.bias = self.w.bias
+        self.myfunc.weight = self.w.weight
+
+    def forward(self, x):
+        return self.myfunc(x)
 
 
 class LoraLayer(GPT2Block):
     @staticmethod
     def set(layer: nn.Module):
         size = layer.attn.c_attn.weight.size()
-        layer.attn.c_attn = MyModule().from_Conv1D(layer.attn.c_attn)
-        layer.attn.c_proj = MyModule().from_Conv1D(layer.attn.c_proj)
+        layer.attn.c_attn = MyModule(layer.attn.c_attn)
 
-        layer.mlp.c_fc = MyModule().from_Conv1D(layer.mlp.c_fc)
-        layer.mlp.c_proj = MyModule().from_Conv1D(layer.mlp.c_proj)
+        size = layer.attn.c_proj.weight.size()
+        layer.attn.c_proj = MyModule(layer.attn.c_proj)
+
+        size = layer.mlp.c_fc .weight.size()
+        layer.mlp.c_fc = MyModule(layer.mlp.c_fc)
+
+        size = layer.mlp.c_proj .weight.size()
+        layer.mlp.c_proj = MyModule(layer.mlp.c_proj)
 
         return layer
 
@@ -252,9 +252,9 @@ class LoraTrainer:
         # re shuffle to self.dataloader
         torch.cuda.empty_cache()
         loss_sum = 0
-        a_rate = 4
+        a_rate = 64
         self.optimizer = Lion(
-            self.model.parameters(), lr=6e-4, weight_decay=5e-5)
+            self.model.parameters(), lr=1e-4)
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
@@ -346,12 +346,26 @@ class BatchLabelSmoothingCrossEntropy(nn.Module):
         return loss
 
 
+class GeneralAdaptiveRobustLoss(nn.Module):
+    def __init__(self, alpha=1.0, beta=2.0):
+        super(GeneralAdaptiveRobustLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, input, target):
+        diff = torch.abs(input - target)
+        loss = (1.0 / (self.alpha * self.beta)) * \
+            (torch.pow((diff / self.alpha), self.beta) + self.beta - 1)
+        return loss.mean(2)
+
+
 class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.2, mask_penalty=0.5):
+    def __init__(self, label_smoothing=0.05, mask_penalty=0.5):
         super().__init__()
         self.pad_id = 3
         self.mask_penalty = mask_penalty
         self.l = BatchLabelSmoothingCrossEntropy(label_smoothing)
+        self.l2 = GeneralAdaptiveRobustLoss()
 
     def forward(self, input, target, attention_mask=None, target2=None):
         batch_size, sequence_length, num_classes = input.size()
@@ -361,8 +375,10 @@ class MyLoss(nn.Module):
         mask_target3 = (target == 2).float()
         mask_target2 = (target != self.pad_id).float()
 
-        loss = self.l(input.view(-1, num_classes), target.view(-1)
-                      ).view(batch_size, sequence_length)
+        # loss = self.l(input.view(-1, num_classes), target.view(-1)).view(batch_size, sequence_length)
+        loss = self.l2(input,
+                       torch.nn.functional.one_hot(target, num_classes))
+
         # target2 とtargetをone hotにする
 
         # Zero out the loss where the target is a pad token
@@ -379,7 +395,7 @@ class MyLoss(nn.Module):
             self.mask_penalty * \
             mask_input.sum(-1)+self.mask_penalty * mask_input2.sum(-1)
 
-        return loss*100
+        return loss
 
 
 def main():
