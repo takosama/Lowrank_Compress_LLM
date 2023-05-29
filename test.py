@@ -107,6 +107,8 @@ class MyConv1D(nn.Module):
         self.weight = w.weight
         self.bias = w.bias
         self.weight.requires_grad = False
+        self.u.requires_grad = True
+        self.v.requires_grad = True
         self.bias.requires_grad = True
         return self
 
