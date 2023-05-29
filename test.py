@@ -262,7 +262,7 @@ class LoraTrainer:
         # re shuffle to self.dataloader
         torch.cuda.empty_cache()
         loss_sum = 0
-        a_rate = 64
+        a_rate = 32
         self.optimizer = Lion(
             self.model.parameters(), lr=1e-4)
         # dataloaderは訓練データのDataLoaderです
@@ -380,14 +380,15 @@ class MyLoss(nn.Module):
     def forward(self, input, target, attention_mask=None, target2=None):
         batch_size, sequence_length, num_classes = input.size()
 
-        # Create a mask from the target tensor
+        # Create a mask from the target  ensor
         mask_target = (target == self.pad_id).float()
         mask_target3 = (target == 2).float()
         mask_target2 = (target != self.pad_id).float()
 
-        # loss = self.l(input.view(-1, num_classes), target.view(-1)).view(batch_size, sequence_length)
-        loss = self.l2(input,
-                       torch.nn.functional.one_hot(target, num_classes))
+        loss = self.l(input.view(-1, num_classes), target.view(-1)
+                      ).view(batch_size, sequence_length)
+       # loss = self.l2(input,
+        #               torch.nn.functional.one_hot(target, num_classes))
 
         # target2 とtargetをone hotにする
 
