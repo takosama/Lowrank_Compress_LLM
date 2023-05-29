@@ -103,10 +103,10 @@ class MyModule(nn.Module):
     def __init__(self, w):
         super().__init__()
         self.rank = 512
-        size = w.size()
+        size = w.weight.size()
         self.myfunc = MyConv1D(size[0], size[1])
-        self.myfunc.bias = self.w.bias
-        self.myfunc.weight = self.w.weight
+        self.myfunc.bias = w.bias
+        self.myfunc.weight = w.weight
 
     def forward(self, x):
         return self.myfunc(x)
