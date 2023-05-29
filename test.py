@@ -1,10 +1,13 @@
 
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.cuda.amp import autocast
+from torch import nn
 from transformers import AdamW, get_cosine_schedule_with_warmup
 from torch.utils.checkpoint import checkpoint
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 import csv
 from torch import Tensor, nn, FloatTensor
-from typing import Tuple
+from typing import List, Optional, Set, Tuple, Union
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 from lion_pytorch import Lion
 from transformers.modeling_outputs import ModelOutput
@@ -85,47 +88,52 @@ class MyConv1D(nn.Module):
         nx (`int`): The number of input features.
     """
 
-    def __init__(self, nf, nx):
+    def __init__(self,  w):
         super().__init__()
-        self.nf = nf
-        self.weight = nn.Parameter(torch.empty(nx, nf))
+        size = w.weight.size()
+        self.nf = size[1]
+        nf = self.nf
+        self.weight = nn.Parameter(torch.empty(size[0], nf))
         self.bias = nn.Parameter(torch.zeros(nf))
+        self.weight.requires_grad = False
+        self.bias.requires_grad = True
+        self.u = nn.Parameter(torch.zeros((size[0], 16)))
+        self.v = nn.Parameter(torch.zeros((16, size[1])))
         nn.init.normal_(self.weight, std=0.02)
+        nn.init.normal_(self.u, std=0.02)
+        nn.init.normal_(self.v, std=0.02)
+
+    def setup(self, w):
+        self.weight = w.weight
+        self.bias = w.bias
+        self.weight.requires_grad = False
+        self.bias.requires_grad = True
+        return self
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+        x = torch.addmm(self.bias, x.view(-1, x.size(-1)),
+                        self.weight+self.u@self.v)
         x = x.view(size_out)
         return x
-
-
-class MyModule(nn.Module):
-    def __init__(self, w):
-        super().__init__()
-        self.rank = 512
-        size = w.weight.size()
-        self.myfunc = MyConv1D(size[0], size[1])
-        self.myfunc.bias = w.bias
-        self.myfunc.weight = w.weight
-
-    def forward(self, x):
-        return self.myfunc(x)
 
 
 class LoraLayer(GPT2Block):
     @staticmethod
     def set(layer: nn.Module):
         size = layer.attn.c_attn.weight.size()
-        layer.attn.c_attn = MyModule(layer.attn.c_attn)
+        layer.attn.c_attn = MyConv1D(
+            layer.attn.c_attn).setup(layer.attn.c_attn)
 
         size = layer.attn.c_proj.weight.size()
-        layer.attn.c_proj = MyModule(layer.attn.c_proj)
+        layer.attn.c_proj = MyConv1D(
+            layer.attn.c_proj).setup(layer.attn.c_proj)
 
         size = layer.mlp.c_fc .weight.size()
-        layer.mlp.c_fc = MyModule(layer.mlp.c_fc)
+        layer.mlp.c_fc = MyConv1D(layer.mlp.c_fc).setup(layer.mlp.c_fc)
 
         size = layer.mlp.c_proj .weight.size()
-        layer.mlp.c_proj = MyModule(layer.mlp.c_proj)
+        layer.mlp.c_proj = MyConv1D(layer.mlp.c_proj).setup(layer.mlp.c_proj)
 
         return layer
 
