@@ -1,4 +1,5 @@
 
+from torch.nn.utils.rnn import pad_sequence
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.cuda.amp import autocast
@@ -38,16 +39,11 @@ class QADataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.cash = []
-        for d in tqdm(range(len(self.data))):
-            self.cash.append(self.get(d))
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.cash[idx]
-
-    def get(self, idx):
         try:
             self.tokenizer.sep_token_id = 5
             d = self.data[idx]
@@ -60,18 +56,15 @@ class QADataset(Dataset):
             question = f"///instruction//{instruction}[SEP]///context//{in_}[SEP]"
             answer = f"{out}</s>"
 
-            # self.tokenizer.pad_token_idv
-
             input = self.tokenizer.encode_plus(question, truncation=True,
-                                               max_length=1024-128, padding="max_length", return_tensors="pt")
-            target_ids = self. tokenizer.encode_plus(answer, truncation=True,
-                                                     max_length=1024-128, padding="max_length", return_tensors="pt")["input_ids"].squeeze(0)
+                                               max_length=1024-128, padding=False, return_tensors="pt")  # Do not pad here
+            target_ids = self.tokenizer.encode_plus(answer, truncation=True,
+                                                    max_length=1024-128, padding=False, return_tensors="pt")["input_ids"]  # Do not pad here
 
-            input_ids = input["input_ids"] .squeeze(0)
-            attention_mask = input["attention_mask"].squeeze(0)
-            # eosを削除
+            input_ids = input["input_ids"]
+            attention_mask = input["attention_mask"]
 
-            return {"input_ids": input_ids[0], "attention_mask": attention_mask, "labels": target_ids[0], "text": question}
+            return {"input_ids": input_ids[0], "attention_mask": attention_mask[0], "labels": target_ids[0], "text": question}
         except Exception as e:
             print(e)
             return {"input_ids": torch.zeros(self.max_length).int(), "attention_mask": torch.zeros(self.max_length).int(), "labels": torch.zeros(self.max_length).int()}
@@ -98,8 +91,8 @@ class MyConv1D(nn.Module):
         self.b = nn.Parameter(torch.zeros(nf))
         self.weight.requires_grad = False
         self.bias.requires_grad = True
-        self.u = nn.Parameter(torch.zeros((size[0], 4)))
-        self.v = nn.Parameter(torch.zeros((4, size[1])))
+        self.u = nn.Parameter(torch.zeros((size[0], 8)))
+        self.v = nn.Parameter(torch.zeros((8, size[1])))
         nn.init.normal_(self.weight, std=0.02)
         nn.init.normal_(self.u, std=0.5)
         nn.init.normal_(self.v, std=0.5)
@@ -121,8 +114,8 @@ class MyConv1D(nn.Module):
                         self.weight.detach()+self.u@self.v)
         x = x.view(size_out)
 
-        self.u.data.clamp_(-1, 1)
-        self.v.data.clamp_(-1, 1)
+        self.u.data.clamp_(-10, 10)
+        self.v.data.clamp_(-10, 10)
         self.b.data.clamp_(-10, 10)
 
         return x
@@ -194,43 +187,7 @@ class LoraTrainer:
 
     def __init__(self,   rank):
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            'rinna/japanese-gpt2-small', use_fast=False)
-
-        torch.cuda.empty_cache()
-        self.device = torch.device(
-            "cuda:0" if torch.cuda.is_available() else "cpu")
-        self.model = GPT2LMHeadModel.from_pretrained(
-            'rinna/japanese-gpt2-small').to(self.device)
-        token = tokenizer.encode("こんにちは", return_tensors="pt").to(self.device)
-        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
-                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
-        print(tokenizer.decode(res[0]))
-        print("------------------------")
-        print(tokenizer.decode(res[1]))
-        print("------------------------")
-        print(tokenizer.decode(res[2]))
-        print("------------------------")
-
-        print()
-        print()
-
-        self.    model = LoraManagerbase.from_pretrained(
-            'rinna/japanese-gpt2-small', self. device, rank=rank).to(self.device).bfloat16()
-        self.model.save_pretrained("test")
-
-        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
-                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
-        print(tokenizer.decode(res[0]))
-        print("------------------------")
-        print(tokenizer.decode(res[1]))
-        print("------------------------")
-        print(tokenizer.decode(res[2]))
-        print("------------------------")
-
-        self.tokenizer = tokenizer
-
-        self.tokenizer.sep_token = self.tokenizer.eos_token
-
+            'rinna/japanese-gpt2-medium', use_fast=False)
         # データを整形
         with open('rinnna_loader/databricks-dolly-15k-translated14801_14900.json', 'r', encoding="utf-8") as f:
             data = json.load(f)
@@ -246,15 +203,78 @@ class LoraTrainer:
         # 保存
         with open('databricks-dolly-15k-translated.json', 'w', encoding="utf-8") as f:
             json.dump(da, f, ensure_ascii=False, indent=4)
+        self.tokenizer = tokenizer
 
         # data を128の倍数に切り捨て
         data = data[:len(data)//128*128]
-
         # 重複削除
         dataset = QADataset(random.sample(data, len(data)),
                             self.tokenizer, max_length=1024)
 
-        self.dataloader = DataLoader(dataset, batch_size=2,   shuffle=True)
+# corate
+        def collate_fn(batch):
+            input_ids = [item['input_ids'] for item in batch]
+            attention_mask = [item['attention_mask'] for item in batch]
+            labels = [item['labels'] for item in batch]
+
+            max_len = max(max(len(ids) for ids in input_ids),
+                          max(len(lbl) for lbl in labels))
+
+            padded_input_ids = []
+            padded_attention_mask = []
+            padded_labels = []
+
+            for ids, mask, lbl in zip(input_ids, attention_mask, labels):
+                pad_input_ids = torch.cat(
+                    (ids, torch.tensor([tokenizer.pad_token_id] * (max_len - len(ids)))), dim=0)
+                pad_attention_mask = torch.cat(
+                    (mask, torch.tensor([0] * (max_len - len(mask)))), dim=0)
+                pad_labels = torch.cat(
+                    (lbl, torch.tensor([tokenizer.pad_token_id] * (max_len - len(lbl)))), dim=0)
+
+                padded_input_ids.append(pad_input_ids)
+                padded_attention_mask.append(pad_attention_mask)
+                padded_labels.append(pad_labels)
+
+            return {
+                'input_ids': torch.stack(padded_input_ids).long(),
+                'attention_mask': torch.stack(padded_attention_mask).long(),
+                'labels': torch.stack(padded_labels).long(),
+            }
+
+        self.dataloader = DataLoader(
+            dataset, batch_size=1,   shuffle=True, collate_fn=collate_fn)
+
+        torch.cuda.empty_cache()
+        self.device = torch.device(
+            "cuda:0" if torch.cuda.is_available() else "cpu")
+        self.model = GPT2LMHeadModel.from_pretrained(
+            'rinna/japanese-gpt2-medium').to(self.device)
+        token = tokenizer.encode("こんにちは", return_tensors="pt").to(self.device)
+        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
+                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+        print(tokenizer.decode(res[0]))
+        print("------------------------")
+        print(tokenizer.decode(res[1]))
+        print("------------------------")
+        print(tokenizer.decode(res[2]))
+        print("------------------------")
+
+        print()
+        print()
+
+        self.    model = LoraManagerbase.from_pretrained(
+            'rinna/japanese-gpt2-medium', self. device, rank=rank).to(self.device).bfloat16()
+        self.model.save_pretrained("test")
+
+        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
+                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+        print(tokenizer.decode(res[0]))
+        print("------------------------")
+        print(tokenizer.decode(res[1]))
+        print("------------------------")
+        print(tokenizer.decode(res[2]))
+        print("------------------------")
 
     def train(self, epochs, criterion):
         # save
@@ -361,99 +381,13 @@ class LoraTrainer:
 def masked_cross_entropy(logits, target, attention_mask):
     loss_fct = nn.CrossEntropyLoss(reduction='none')  # 'none'で各要素の損失を計算
     loss = loss_fct(logits.view(-1, logits.size(-1)), target.view(-1))
-    mask = attention_mask.view(-1)
-    loss = loss * mask  # アテンションマスクを適用
-    return loss.sum() / mask.sum()  # マスクを適用した部分だけで平均を取る
 
-
-def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=-100, reduce=True, attn_mask=None):
-    if target.dim() == lprobs.dim() - 1:
-        target = target.unsqueeze(-1)
-    nll_loss = -lprobs.gather(dim=-1, index=target)
-    smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
-    if ignore_index is not None:
-        pad_mask = target.eq(ignore_index)
-        nll_loss.masked_fill_(pad_mask, 0.0)
-        smooth_loss.masked_fill_(pad_mask, 0.0)
-    else:
-        nll_loss = nll_loss.squeeze(-1)
-        smooth_loss = smooth_loss.squeeze(-1)
-
-    # Apply attention mask
-    if attn_mask is not None:
-        # Ensure the mask is of type bool and expand dimensions
-        attn_mask = attn_mask.unsqueeze(-1).bool()
-        nll_loss.masked_fill_(~attn_mask, 0.0)
-        smooth_loss.masked_fill_(~attn_mask, 0.0)
-
-    nll_loss = nll_loss.sum()  # mean()?累積したロスをバッチサイズで割る必要がある場合
-    smooth_loss = smooth_loss.sum()
-    eps_i = epsilon / lprobs.size(-1)
-    loss = (1.0 - epsilon) * nll_loss + eps_i * smooth_loss
-    return loss
-
-
-class HuberLoss(nn.Module):
-    def __init__(self, delta=1.0):
-        super(HuberLoss, self).__init__()
-        self.delta = delta
-
-    def forward(self, input, target):
-        diff = input - target
-        abs_diff = torch.abs_(diff)
-        loss = ((abs_diff < self.delta) * 0.5 * diff**2) \
-            + ((abs_diff >= self.delta) *
-               self.delta * (abs_diff - 0.5 * self.delta))
-        return loss
-
-
-class myloss_fn(nn.Module):
-    def __init__(self, smoothing):
-        super(myloss_fn, self).__init__()
-        self.smoothing = smoothing
-        self.criterion = HuberLoss()
-
-    def forward(self, input, target):
-        log_prob = -F.log_softmax(input, dim=-1)
-        weight = (input.new_ones(input.size()) *
-                  self.smoothing / (input.size(-1) - 1.)).detach()
-        weight = weight.scatter_(-1, target.unsqueeze(-1),
-                                 (1. - self.smoothing)).detach()
-        weight = -F.log_softmax(weight, dim=-1)
-
-       # loss = ((weight * -log_prob)*(weight * -log_prob)).sum(dim=-1)
-        torch.cuda.empty_cache()
-
-        loss = self.criterion(log_prob, weight)
-        return loss
-
-
-class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.2):
-        super().__init__()
-        self.pad_id = 3
-        self.l = myloss_fn(label_smoothing)
-
-    def forward(self, input, target, attention_mask=None, target2=None):
-        batch_size, sequence_length, num_classes = input.size()
-
-        # Create a mask from the target  ensor
-        mask_target = (target == self.pad_id).float()
-        mask_target2 = (target != self.pad_id).float()
-
-        loss = self.l(input.view(-1, num_classes), target.view(-1)
-                      )
-        loss = loss.mean(1).view(1, -1)
-        loss = loss * (1 - mask_target)
-
-        loss = loss.sum(-1)/mask_target2.sum(-1)
-
-        return loss
+    return loss.mean()
 
 
 def main():
 
-    criterion = MyLoss()
+    criterion = int()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     epochs = 100
