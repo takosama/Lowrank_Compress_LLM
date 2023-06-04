@@ -296,8 +296,6 @@ class LoraTrainer:
         self.optimizer = Lion(
             self.model.parameters(), lr=6e-4, weight_decay=1e-3)
         # dataloaderは訓練データのDataLoaderです
-        scheduler = lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.8, patience=10)
 
         self.optimizer.zero_grad()
         h_ = len(self.model.base_model.h)
@@ -339,9 +337,8 @@ class LoraTrainer:
                     self.optimizer.step()
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
-                    scheduler.step(loss_sum)
 
-                if (step+1) % (4*64) == 0 or step == 0:
+                if (step+1) % (4*64) == 0:
 
                     inputs = inputs[0].squeeze(0).unsqueeze(0)
                     # paddingを削除
@@ -379,7 +376,8 @@ class LoraTrainer:
 
 
 def masked_cross_entropy(logits, target, attention_mask):
-    loss_fct = nn.CrossEntropyLoss(reduction='none')  # 'none'で各要素の損失を計算
+    loss_fct = nn.CrossEntropyLoss(
+        reduction='mean', ignore_index=3, label_smoothing=0.1)  # 'none'で各要素の損失を計算
     loss = loss_fct(logits.view(-1, logits.size(-1)), target.view(-1))
 
     return loss.mean()
