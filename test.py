@@ -1,4 +1,5 @@
 
+import torch.optim.lr_scheduler as lr_scheduler
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.cuda.amp import autocast
 from torch import nn
@@ -57,20 +58,19 @@ class QADataset(Dataset):
             out = d["response"]
             out = str.lower(out)
             question = f"///instruction//{instruction}[SEP]///context//{in_}[SEP]"
-            answer = f"///response//{out}</s>"
+            answer = f"{out}</s>"
 
             # self.tokenizer.pad_token_idv
 
-            input_ids = self.tokenizer.encode(question, truncation=True,
-                                              max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=True)
-            target_ids = self. tokenizer.encode(answer, truncation=True,
-                                                max_length=1024, padding="max_length", return_tensors="pt", add_special_tokens=True)
-            # 4 padを0にする
-            attention_mask = (input_ids != 3).long()
-            # 次元を落とす
-            attention_mask = attention_mask.squeeze(0)
-            if input_ids[0].shape[0] != 256 or attention_mask.shape[0] != 256 or target_ids[0].shape[0] != 256:
-                pass
+            input = self.tokenizer.encode_plus(question, truncation=True,
+                                               max_length=1024-128, padding="max_length", return_tensors="pt")
+            target_ids = self. tokenizer.encode_plus(answer, truncation=True,
+                                                     max_length=1024-128, padding="max_length", return_tensors="pt")["input_ids"].squeeze(0)
+
+            input_ids = input["input_ids"] .squeeze(0)
+            attention_mask = input["attention_mask"].squeeze(0)
+            # eosを削除
+
             return {"input_ids": input_ids[0], "attention_mask": attention_mask, "labels": target_ids[0], "text": question}
         except Exception as e:
             print(e)
@@ -95,13 +95,15 @@ class MyConv1D(nn.Module):
         nf = self.nf
         self.weight = nn.Parameter(torch.empty(size[0], nf))
         self.bias = nn.Parameter(torch.zeros(nf))
+        self.b = nn.Parameter(torch.zeros(nf))
         self.weight.requires_grad = False
         self.bias.requires_grad = True
-        self.u = nn.Parameter(torch.zeros((size[0], 16)))
-        self.v = nn.Parameter(torch.zeros((16, size[1])))
+        self.u = nn.Parameter(torch.zeros((size[0], 4)))
+        self.v = nn.Parameter(torch.zeros((4, size[1])))
         nn.init.normal_(self.weight, std=0.02)
-        nn.init.normal_(self.u, std=0.02)
-        nn.init.normal_(self.v, std=0.02)
+        nn.init.normal_(self.u, std=0.5)
+        nn.init.normal_(self.v, std=0.5)
+        nn.init.normal_(self.b, std=1)
 
     def setup(self, w):
         self.weight = w.weight
@@ -109,14 +111,20 @@ class MyConv1D(nn.Module):
         self.weight.requires_grad = False
         self.u.requires_grad = True
         self.v.requires_grad = True
-        self.bias.requires_grad = True
+        self.b.requires_grad = True
+        self.bias.requires_grad = False
         return self
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias, x.view(-1, x.size(-1)),
-                        self.weight+self.u@self.v)
+        x = torch.addmm(self.bias.detach()+self.b, x.view(-1, x.size(-1)),
+                        self.weight.detach()+self.u@self.v)
         x = x.view(size_out)
+
+        self.u.data.clamp_(-1, 1)
+        self.v.data.clamp_(-1, 1)
+        self.b.data.clamp_(-10, 10)
+
         return x
 
 
@@ -156,7 +164,9 @@ class LoraManagerbase(AutoModelWithLMHead):
         model.base_model.wte = model.base_model.wte.to(device)
         model.base_model.wpe = model.base_model.wpe.to(device)
         model.base_model.drop = model.base_model.drop
-
+        model.base_model.ln_f.requires_grad = True
+        model.base_model.wte.requires_grad = True
+        model.base_model.wpe.requires_grad = True
         return model
 
     @ classmethod
@@ -262,15 +272,16 @@ class LoraTrainer:
         # re shuffle to self.dataloader
         torch.cuda.empty_cache()
         loss_sum = 0
-        a_rate = 32
+        a_rate = 4
         self.optimizer = Lion(
-            self.model.parameters(), lr=1e-4)
+            self.model.parameters(), lr=6e-4, weight_decay=1e-3)
         # dataloaderは訓練データのDataLoaderです
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.8, patience=10)
 
         self.optimizer.zero_grad()
         h_ = len(self.model.base_model.h)
         self.model.train()
-
         for epoch in range(epochs):
             tq = tqdm(self.dataloader)
 
@@ -291,18 +302,24 @@ class LoraTrainer:
 
                 torch.cuda.empty_cache()
 
-                loss = lora_outputs["logits"]
-                loss = criterion(loss, labels, inputs, attention_mask)/a_rate
-                torch.cuda.empty_cache()
-                loss = loss.mean()
-                loss.backward()
+                logits = lora_outputs["logits"]
+            #    loss = criterion(logits, labels, inputs,
+             #                    attention_mask).mean()/a_rate
+                loss = masked_cross_entropy(
+                    logits, labels,  attention_mask)/a_rate
 
                 torch.cuda.empty_cache()
+               # loss = lora_outputs["loss"]/a_rate
+                loss.backward()
+                loss_sum += loss
+                torch.cuda.empty_cache()
                 if (step+1) % a_rate == 0:
+
                     torch.cuda.empty_cache()
                     self.optimizer.step()
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
+                    scheduler.step(loss_sum)
 
                 if (step+1) % (4*64) == 0 or step == 0:
 
@@ -312,7 +329,7 @@ class LoraTrainer:
 
                     with torch.no_grad():
                         token = self.model.generate(
-                            inputs, max_length=1024, do_sample=True,  top_k=500, top_p=0.8, num_return_sequences=3, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
+                            inputs, max_length=1024, do_sample=True,  top_k=50, top_p=0.8, num_return_sequences=3, no_repeat_ngram_size=4,  num_beams=3, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
                     print("--------------------")
                     print(self.tokenizer.decode(token[0]))
                     print("--------------------")
@@ -341,70 +358,95 @@ class LoraTrainer:
             torch.cuda.empty_cache()
 
 
-class BatchLabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing):
-        super(BatchLabelSmoothingCrossEntropy, self).__init__()
-        self.smoothing = smoothing
+def masked_cross_entropy(logits, target, attention_mask):
+    loss_fct = nn.CrossEntropyLoss(reduction='none')  # 'none'で各要素の損失を計算
+    loss = loss_fct(logits.view(-1, logits.size(-1)), target.view(-1))
+    mask = attention_mask.view(-1)
+    loss = loss * mask  # アテンションマスクを適用
+    return loss.sum() / mask.sum()  # マスクを適用した部分だけで平均を取る
+
+
+def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=-100, reduce=True, attn_mask=None):
+    if target.dim() == lprobs.dim() - 1:
+        target = target.unsqueeze(-1)
+    nll_loss = -lprobs.gather(dim=-1, index=target)
+    smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
+    if ignore_index is not None:
+        pad_mask = target.eq(ignore_index)
+        nll_loss.masked_fill_(pad_mask, 0.0)
+        smooth_loss.masked_fill_(pad_mask, 0.0)
+    else:
+        nll_loss = nll_loss.squeeze(-1)
+        smooth_loss = smooth_loss.squeeze(-1)
+
+    # Apply attention mask
+    if attn_mask is not None:
+        # Ensure the mask is of type bool and expand dimensions
+        attn_mask = attn_mask.unsqueeze(-1).bool()
+        nll_loss.masked_fill_(~attn_mask, 0.0)
+        smooth_loss.masked_fill_(~attn_mask, 0.0)
+
+    nll_loss = nll_loss.sum()  # mean()?累積したロスをバッチサイズで割る必要がある場合
+    smooth_loss = smooth_loss.sum()
+    eps_i = epsilon / lprobs.size(-1)
+    loss = (1.0 - epsilon) * nll_loss + eps_i * smooth_loss
+    return loss
+
+
+class HuberLoss(nn.Module):
+    def __init__(self, delta=1.0):
+        super(HuberLoss, self).__init__()
+        self.delta = delta
 
     def forward(self, input, target):
-        log_prob = F.log_softmax(input, dim=-1)
-        weight = (input.new_ones(input.size()) *
-                  self.smoothing / (input.size(-1) - 1.)).detach()
-        weight.scatter_(-1, target.unsqueeze(-1),
-                        (1. - self.smoothing)).detach()
-        loss = (-weight * log_prob).sum(dim=-1)
+        diff = input - target
+        abs_diff = torch.abs_(diff)
+        loss = ((abs_diff < self.delta) * 0.5 * diff**2) \
+            + ((abs_diff >= self.delta) *
+               self.delta * (abs_diff - 0.5 * self.delta))
         return loss
 
 
-class GeneralAdaptiveRobustLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=2.0):
-        super(GeneralAdaptiveRobustLoss, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
+class myloss_fn(nn.Module):
+    def __init__(self, smoothing):
+        super(myloss_fn, self).__init__()
+        self.smoothing = smoothing
+        self.criterion = HuberLoss()
 
     def forward(self, input, target):
-        diff = torch.abs(input - target)
-        loss = (1.0 / (self.alpha * self.beta)) * \
-            (torch.pow((diff / self.alpha), self.beta) + self.beta - 1)
-        return loss.mean(2)
+        log_prob = -F.log_softmax(input, dim=-1)
+        weight = (input.new_ones(input.size()) *
+                  self.smoothing / (input.size(-1) - 1.)).detach()
+        weight = weight.scatter_(-1, target.unsqueeze(-1),
+                                 (1. - self.smoothing)).detach()
+        weight = -F.log_softmax(weight, dim=-1)
+
+       # loss = ((weight * -log_prob)*(weight * -log_prob)).sum(dim=-1)
+        torch.cuda.empty_cache()
+
+        loss = self.criterion(log_prob, weight)
+        return loss
 
 
 class MyLoss(nn.Module):
-    def __init__(self, label_smoothing=0.05, mask_penalty=0.5):
+    def __init__(self, label_smoothing=0.2):
         super().__init__()
         self.pad_id = 3
-        self.mask_penalty = mask_penalty
-        self.l = BatchLabelSmoothingCrossEntropy(label_smoothing)
-        self.l2 = GeneralAdaptiveRobustLoss()
+        self.l = myloss_fn(label_smoothing)
 
     def forward(self, input, target, attention_mask=None, target2=None):
         batch_size, sequence_length, num_classes = input.size()
 
         # Create a mask from the target  ensor
         mask_target = (target == self.pad_id).float()
-        mask_target3 = (target == 2).float()
         mask_target2 = (target != self.pad_id).float()
 
         loss = self.l(input.view(-1, num_classes), target.view(-1)
-                      ).view(batch_size, sequence_length)
-       # loss = self.l2(input,
-        #               torch.nn.functional.one_hot(target, num_classes))
-
-        # target2 とtargetをone hotにする
-
-        # Zero out the loss where the target is a pad token
-        # Note the "1 - mask_target"
+                      )
+        loss = loss.mean(1).view(1, -1)
         loss = loss * (1 - mask_target)
-        loss = loss * (1 - mask_target3)
 
-        # Create a mask from the input tensor (apply softmax to get probabilities)
-        input_probs = torch.softmax(input, dim=1)
-        mask_input = (input_probs.argmax(dim=-1) == self.pad_id).float()
-        mask_input2 = (input_probs.argmax(dim=-1) == 2).float()
-        # Add a penalty for each mask in the input (predictions)
-        loss = loss.sum(-1)/mask_target2.sum(-1) + \
-            self.mask_penalty * \
-            mask_input.sum(-1)+self.mask_penalty * mask_input2.sum(-1)
+        loss = loss.sum(-1)/mask_target2.sum(-1)
 
         return loss
 
@@ -424,6 +466,6 @@ def main():
 
 if __name__ == "__main__":
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        'rinna/japanese-gpt2-small', use_fast=False)
+        'rinna/japanese-gpt2-medium', use_fast=False)
 
     main()
