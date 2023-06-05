@@ -91,12 +91,12 @@ class MyConv1D(nn.Module):
         self.b = nn.Parameter(torch.zeros(nf))
         self.weight.requires_grad = False
         self.bias.requires_grad = True
-        self.u = nn.Parameter(torch.zeros((size[0], 8)))
-        self.v = nn.Parameter(torch.zeros((8, size[1])))
+        self.u = nn.Parameter(torch.zeros((size[0], 6)))
+        self.v = nn.Parameter(torch.zeros((6, size[1])))
         nn.init.normal_(self.weight, std=0.02)
-        nn.init.normal_(self.u, std=0.5)
-        nn.init.normal_(self.v, std=0.5)
-        nn.init.normal_(self.b, std=1)
+        nn.init.normal_(self.u, std=0.01)
+        nn.init.normal_(self.v, std=0.01)
+        nn.init.normal_(self.b, std=0.01)
 
     def setup(self, w):
         self.weight = w.weight
@@ -110,13 +110,11 @@ class MyConv1D(nn.Module):
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-        x = torch.addmm(self.bias.detach()+self.b, x.view(-1, x.size(-1)),
-                        self.weight.detach()+self.u@self.v)
-        x = x.view(size_out)
-
-        self.u.data.clamp_(-10, 10)
-        self.v.data.clamp_(-10, 10)
-        self.b.data.clamp_(-10, 10)
+        z = torch.addmm(self.bias, x.view(-1, x.size(-1)),
+                        self.weight)
+        y = torch.addmm(self.b, x.view(-1, x.size(-1)),
+                        self.u@self.v)
+        x = (z.detach()+y).view(size_out)
 
         return x
 
@@ -187,9 +185,9 @@ class LoraTrainer:
 
     def __init__(self,   rank):
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            'rinna/japanese-gpt2-medium', use_fast=False)
+            'rinna/japanese-gpt2-small', use_fast=False)
         # データを整形
-        with open('rinnna_loader/databricks-dolly-15k-translated14801_14900.json', 'r', encoding="utf-8") as f:
+        with open('databricks-dolly-15k-translated.json', 'r', encoding="utf-8") as f:
             data = json.load(f)
 
         # unicodeエスケープを解除
@@ -200,6 +198,7 @@ class LoraTrainer:
             for k in d:
                 p[k] = unicodedata.normalize('NFKC', d[k])
             da.append(p)
+        random.shuffle(da)
         # 保存
         with open('databricks-dolly-15k-translated.json', 'w', encoding="utf-8") as f:
             json.dump(da, f, ensure_ascii=False, indent=4)
@@ -292,9 +291,9 @@ class LoraTrainer:
         # re shuffle to self.dataloader
         torch.cuda.empty_cache()
         loss_sum = 0
-        a_rate = 4
+        a_rate = 16
         self.optimizer = Lion(
-            self.model.parameters(), lr=6e-4, weight_decay=1e-3)
+            self.model.parameters(), lr=1e-4, weight_decay=1e-4)
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
@@ -339,6 +338,7 @@ class LoraTrainer:
                     self.optimizer.zero_grad()
 
                 if (step+1) % (4*64) == 0:
+                    torch.cuda.empty_cache()
 
                     inputs = inputs[0].squeeze(0).unsqueeze(0)
                     # paddingを削除
@@ -346,7 +346,7 @@ class LoraTrainer:
 
                     with torch.no_grad():
                         token = self.model.generate(
-                            inputs, max_length=1024, do_sample=True,  top_k=50, top_p=0.8, num_return_sequences=3, no_repeat_ngram_size=4,  num_beams=3, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
+                            inputs, max_length=1024, do_sample=True,  top_k=500, num_return_sequences=3, no_repeat_ngram_size=3,  num_beams=3, pad_token_id=self.tokenizer.pad_token_id, eos_token_id=self.tokenizer.eos_token_id)
                     print("--------------------")
                     print(self.tokenizer.decode(token[0]))
                     print("--------------------")
