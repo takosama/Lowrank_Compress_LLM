@@ -2,7 +2,6 @@
 from torch.nn.utils.rnn import pad_sequence
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from torch.cuda.amp import autocast
 from torch import nn
 from transformers import AdamW, get_cosine_schedule_with_warmup
 from torch.utils.checkpoint import checkpoint
@@ -49,17 +48,17 @@ class QADataset(Dataset):
             d = self.data[idx]
             instruction = d["instruction"]
             instruction = str.lower(instruction)
-            in_ = d["context"]
+            in_ = d["input"]
             in_ = str.lower(in_)
-            out = d["response"]
+            out = d["output"]
             out = str.lower(out)
             question = f"///instruction//{instruction}[SEP]///context//{in_}[SEP]"
             answer = f"{out}</s>"
 
             input = self.tokenizer.encode_plus(question, truncation=True,
-                                               max_length=1024-128, padding=False, return_tensors="pt")  # Do not pad here
+                                               max_length=1024, padding=False, return_tensors="pt")  # Do not pad here
             target_ids = self.tokenizer.encode_plus(answer, truncation=True,
-                                                    max_length=1024-128, padding=False, return_tensors="pt")["input_ids"]  # Do not pad here
+                                                    max_length=1024, padding=False, return_tensors="pt")["input_ids"]  # Do not pad here
 
             input_ids = input["input_ids"]
             attention_mask = input["attention_mask"]
@@ -71,49 +70,44 @@ class QADataset(Dataset):
 
 
 class MyConv1D(nn.Module):
-    """
-    1D-convolutional layer as defined by Radford et al. for OpenAI GPT (and also used in GPT-2).
-
-    Basically works like a linear layer but the weights are transposed.
-
-    Args:
-        nf (`int`): The number of output features.
-        nx (`int`): The number of input features.
-    """
-
     def __init__(self,  w):
         super().__init__()
         size = w.weight.size()
         self.nf = size[1]
         nf = self.nf
-        self.weight = nn.Parameter(torch.empty(size[0], nf))
+        self.w = nn.Parameter(torch.empty(size[0], nf))
+        self.w.requires_grad = False
+
         self.bias = nn.Parameter(torch.zeros(nf))
         self.b = nn.Parameter(torch.zeros(nf))
-        self.weight.requires_grad = False
-        self.bias.requires_grad = True
-        self.u = nn.Parameter(torch.zeros((size[0], 6)))
-        self.v = nn.Parameter(torch.zeros((6, size[1])))
-        nn.init.normal_(self.weight, std=0.02)
-        nn.init.normal_(self.u, std=0.01)
-        nn.init.normal_(self.v, std=0.01)
-        nn.init.normal_(self.b, std=0.01)
+
+        self.bias.requires_grad = False
+        self.u = nn.Parameter(torch.zeros((size[0], 8)))
+        self.v = nn.Parameter(torch.zeros((8, size[1])))
+
+        # nn.init.normal_(self.u, std=0.02)
+        # nn.init.normal_(self.v, std=0.02)
+        # nn.init.normal_(self.b, std=0.02)
 
     def setup(self, w):
-        self.weight = w.weight
+        self.w = w.weight
         self.bias = w.bias
-        self.weight.requires_grad = False
+        self.w.requires_grad = False
         self.u.requires_grad = True
         self.v.requires_grad = True
         self.b.requires_grad = True
         self.bias.requires_grad = False
         return self
 
+    @torch.compile
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
-        z = torch.addmm(self.bias, x.view(-1, x.size(-1)),
-                        self.weight)
+        z = torch.addmm(self.bias.detach(), x.view(-1, x.size(-1)),
+                        self.w.detach())
+
         y = torch.addmm(self.b, x.view(-1, x.size(-1)),
                         self.u@self.v)
+
         x = (z.detach()+y).view(size_out)
 
         return x
@@ -121,19 +115,16 @@ class MyConv1D(nn.Module):
 
 class LoraLayer(GPT2Block):
     @staticmethod
+    @torch.compile
     def set(layer: nn.Module):
-        size = layer.attn.c_attn.weight.size()
         layer.attn.c_attn = MyConv1D(
             layer.attn.c_attn).setup(layer.attn.c_attn)
 
-        size = layer.attn.c_proj.weight.size()
         layer.attn.c_proj = MyConv1D(
             layer.attn.c_proj).setup(layer.attn.c_proj)
 
-        size = layer.mlp.c_fc .weight.size()
         layer.mlp.c_fc = MyConv1D(layer.mlp.c_fc).setup(layer.mlp.c_fc)
 
-        size = layer.mlp.c_proj .weight.size()
         layer.mlp.c_proj = MyConv1D(layer.mlp.c_proj).setup(layer.mlp.c_proj)
 
         return layer
@@ -144,7 +135,9 @@ class LoraManagerbase(AutoModelWithLMHead):
         super().__init__(config=config)
 
     @classmethod
+    @torch.compile
     def SetUp(self, model, rank, device):
+        model = model.bfloat16()
         model.base_model.h = nn.ModuleList(
             [LoraLayer.set(layer.to(device))
              for layer in model.base_model.h]
@@ -185,9 +178,9 @@ class LoraTrainer:
 
     def __init__(self,   rank):
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            'rinna/japanese-gpt2-small', use_fast=False)
+            'rinna/japanese-gpt2-medium', use_fast=False)
         # データを整形
-        with open('databricks-dolly-15k-translated.json', 'r', encoding="utf-8") as f:
+        with open('data.json', 'r', encoding="utf-8") as f:
             data = json.load(f)
 
         # unicodeエスケープを解除
@@ -205,7 +198,7 @@ class LoraTrainer:
         self.tokenizer = tokenizer
 
         # data を128の倍数に切り捨て
-        data = data[:len(data)//128*128]
+        data = data[:len(data)//16*16]
         # 重複削除
         dataset = QADataset(random.sample(data, len(data)),
                             self.tokenizer, max_length=1024)
@@ -247,23 +240,24 @@ class LoraTrainer:
         torch.cuda.empty_cache()
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
-        self.model = GPT2LMHeadModel.from_pretrained(
-            'rinna/japanese-gpt2-medium').to(self.device)
+    #    self.model = GPT2LMHeadModel.from_pretrained(
+     #       'rinna/japanese-gpt-1b').to(self.device)
         token = tokenizer.encode("こんにちは", return_tensors="pt").to(self.device)
-        res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
-                                  num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
-        print(tokenizer.decode(res[0]))
-        print("------------------------")
-        print(tokenizer.decode(res[1]))
-        print("------------------------")
-        print(tokenizer.decode(res[2]))
-        print("------------------------")
+       # res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
+        #                          num_return_sequences=3, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+#        print(tokenizer.decode(res[0]))
+ #       print("------------------------")
+  #      print(tokenizer.decode(res[1]))
+   #     print("------------------------")
+    #    print(tokenizer.decode(res[2]))
+     #   print("------------------------")
 
         print()
         print()
 
         self.    model = LoraManagerbase.from_pretrained(
             'rinna/japanese-gpt2-medium', self. device, rank=rank).to(self.device).bfloat16()
+
         self.model.save_pretrained("test")
 
         res = self.model.generate(token, max_length=1024, do_sample=True,  top_k=500, top_p=0.8,
@@ -277,7 +271,7 @@ class LoraTrainer:
 
     def train(self, epochs, criterion):
         # save
-        epoch = 0
+        epoch = 10
         torch.cuda.empty_cache()
 
         step = 0
@@ -293,11 +287,10 @@ class LoraTrainer:
         loss_sum = 0
         a_rate = 16
         self.optimizer = Lion(
-            self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+            self.model.parameters(), lr=1e-4, weight_decay=1e-2)
         # dataloaderは訓練データのDataLoaderです
 
         self.optimizer.zero_grad()
-        h_ = len(self.model.base_model.h)
         self.model.train()
         for epoch in range(epochs):
             tq = tqdm(self.dataloader)
@@ -337,6 +330,17 @@ class LoraTrainer:
                     torch.cuda.empty_cache()
                     self.optimizer.zero_grad()
 
+# save to csv
+                    path = "loss.csv"
+                    loss_sum = loss_sum/a_rate
+                    if not os.path.exists(path):
+                        with open(path, 'w') as f:
+                            f.write(f"{loss*a_rate }\n")
+                    else:
+                        with open(path, 'a') as f:
+                            f.write(f"{loss*a_rate }\n")
+                    loss_sum = 0
+
                 if (step+1) % (4*64) == 0:
                     torch.cuda.empty_cache()
 
@@ -357,14 +361,6 @@ class LoraTrainer:
 
                 tq.set_description(
                     f"step {step} loss: {loss.item()*a_rate:.5f}")
-                # save to csv
-                path = "loss.csv"
-                if not os.path.exists(path):
-                    with open(path, 'w') as f:
-                        f.write(f"{loss*a_rate }\n")
-                else:
-                    with open(path, 'a') as f:
-                        f.write(f"{loss*a_rate }\n")
 
                 step += 1
                 torch.cuda.empty_cache()
@@ -377,10 +373,11 @@ class LoraTrainer:
 
 def masked_cross_entropy(logits, target, attention_mask):
     loss_fct = nn.CrossEntropyLoss(
-        reduction='mean', ignore_index=3, label_smoothing=0.1)  # 'none'で各要素の損失を計算
+        reduction='mean', ignore_index=3, label_smoothing=0.2)  # 'none'で各要素の損失を計算
     loss = loss_fct(logits.view(-1, logits.size(-1)), target.view(-1))
-
-    return loss.mean()
+    mask = attention_mask.view(-1).float()
+    loss = loss * mask  # apply mask to loss
+    return loss.sum() / mask.sum()  # normalize the loss
 
 
 def main():
