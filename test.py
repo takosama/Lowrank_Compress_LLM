@@ -69,63 +69,22 @@ class QADataset(Dataset):
             return {"input_ids": torch.zeros(self.max_length).int(), "attention_mask": torch.zeros(self.max_length).int(), "labels": torch.zeros(self.max_length).int()}
 
 
-class MyConv1D(nn.Module):
-    def __init__(self,  w):
-        super().__init__()
-        size = w.weight.size()
-        self.nf = size[1]
-        nf = self.nf
-        self.w = nn.Parameter(torch.empty(size[0], nf))
-        self.w.requires_grad = False
-
-        self.bias = nn.Parameter(torch.zeros(nf))
-        self.b = nn.Parameter(torch.zeros(nf))
-
-        self.bias.requires_grad = False
-        self.u = nn.Parameter(torch.zeros((size[0], 8)))
-        self.v = nn.Parameter(torch.zeros((8, size[1])))
-
-        # nn.init.normal_(self.u, std=0.02)
-        # nn.init.normal_(self.v, std=0.02)
-        # nn.init.normal_(self.b, std=0.02)
-
-    def setup(self, w):
-        self.w = w.weight
-        self.bias = w.bias
-        self.w.requires_grad = False
-        self.u.requires_grad = True
-        self.v.requires_grad = True
-        self.b.requires_grad = True
-        self.bias.requires_grad = False
-        return self
-
-    @torch.compile
-    def forward(self, x):
-        size_out = x.size()[:-1] + (self.nf,)
-        z = torch.addmm(self.bias.detach(), x.view(-1, x.size(-1)),
-                        self.w.detach())
-
-        y = torch.addmm(self.b, x.view(-1, x.size(-1)),
-                        self.u@self.v)
-
-        x = (z.detach()+y).view(size_out)
-
-        return x
+from low_rank import MyConv1D
 
 
 class LoraLayer(GPT2Block):
     @staticmethod
     @torch.compile
-    def set(layer: nn.Module):
+    def set(layer: nn.Module, rank: int = 8):
         layer.attn.c_attn = MyConv1D(
-            layer.attn.c_attn).setup(layer.attn.c_attn)
+            layer.attn.c_attn, rank=rank).setup(layer.attn.c_attn)
 
         layer.attn.c_proj = MyConv1D(
-            layer.attn.c_proj).setup(layer.attn.c_proj)
+            layer.attn.c_proj, rank=rank).setup(layer.attn.c_proj)
 
-        layer.mlp.c_fc = MyConv1D(layer.mlp.c_fc).setup(layer.mlp.c_fc)
+        layer.mlp.c_fc = MyConv1D(layer.mlp.c_fc, rank=rank).setup(layer.mlp.c_fc)
 
-        layer.mlp.c_proj = MyConv1D(layer.mlp.c_proj).setup(layer.mlp.c_proj)
+        layer.mlp.c_proj = MyConv1D(layer.mlp.c_proj, rank=rank).setup(layer.mlp.c_proj)
 
         return layer
 
@@ -139,7 +98,7 @@ class LoraManagerbase(AutoModelWithLMHead):
     def SetUp(self, model, rank, device):
         model = model.bfloat16()
         model.base_model.h = nn.ModuleList(
-            [LoraLayer.set(layer.to(device))
+            [LoraLayer.set(layer.to(device), rank=rank)
              for layer in model.base_model.h]
         )
 
